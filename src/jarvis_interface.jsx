@@ -11,6 +11,16 @@ const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 
+// Mappe le mimeType MediaRecorder vers une extension acceptée par Groq Whisper
+// iOS Safari ne supporte pas webm, il enregistre en audio/mp4 (AAC) - on s'adapte
+function audioExtFromMime(mimeType) {
+  if (!mimeType) return 'webm'
+  if (mimeType.includes('webm')) return 'webm'
+  if (mimeType.includes('ogg')) return 'ogg'
+  if (mimeType.includes('mp4')) return 'mp4'
+  return 'webm'
+}
+
 // ========== Composant JarvisOrb (SVG animé) ==========
 // state: 'idle' (breathing) | 'listening' (user parle) | 'speaking' (Jarvis parle)
 function JarvisOrb({ state = 'idle', size = 180 }) {
@@ -87,20 +97,21 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [isListening, setIsListening] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [isJarvisSpeaking, setIsJarvisSpeaking] = useState(false)
-  const [interimTranscript, setInterimTranscript] = useState('')
-  const [finalTranscript, setFinalTranscript] = useState('')
   const [showSettings, setShowSettings] = useState(false)
   const [error, setError] = useState(null)
-  const [speechSupported, setSpeechSupported] = useState(true)
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [orbSize, setOrbSize] = useState(550)  // responsive : recalculé selon viewport
 
   const [elevenlabsKey, setElevenlabsKey] = useState('')
   const [elevenlabsVoiceId, setElevenlabsVoiceId] = useState(DEFAULT_VOICE_ID)
 
-  const recognitionRef = useRef(null)
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
+
+  // Refs MediaRecorder - on remplace Web Speech API par capture audio + transcription serveur Whisper
+  const mediaRecorderRef = useRef(null)
+  const audioChunksRef = useRef([])
+  const mediaStreamRef = useRef(null)
 
   // Calcul de la taille de l'orb selon le viewport - responsive desktop/tablet/mobile
   useEffect(() => {
@@ -132,27 +143,14 @@ export default function JarvisInterface({ auth, onLogout }) {
     localStorage.setItem(prefsKey(auth.user.id), JSON.stringify({ elevenlabsKey, elevenlabsVoiceId }))
   }, [auth.user.id, elevenlabsKey, elevenlabsVoiceId])
 
-  // Web Speech API setup
+  // Cleanup à l'unmount : libère le micro si toujours actif (sinon icone micro reste allumée dans l'OS)
   useEffect(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SR) { setSpeechSupported(false); return }
-    const rec = new SR()
-    rec.continuous = false
-    rec.interimResults = true
-    rec.lang = 'fr-FR'
-    rec.onresult = (event) => {
-      let interim = '', final = ''
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const t = event.results[i][0].transcript
-        if (event.results[i].isFinal) final += t
-        else interim += t
+    return () => {
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop()
       }
-      if (interim) setInterimTranscript(interim)
-      if (final) setFinalTranscript(prev => prev + final)
+      mediaStreamRef.current?.getTracks().forEach(t => t.stop())
     }
-    rec.onerror = (e) => { setError(`Erreur micro : ${e.error}`); setIsListening(false) }
-    rec.onend = () => setIsListening(false)
-    recognitionRef.current = rec
   }, [])
 
   useEffect(() => {
@@ -270,39 +268,103 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [auth.token, elevenlabsKey, elevenlabsVoiceId, onLogout])
 
-  const toggleListening = () => {
-    if (!speechSupported) {
-      setError("Reconnaissance vocale non supportée (utilise Chrome/Edge).")
-      return
-    }
-    setError(null)
-    if (isListening) {
-      recognitionRef.current?.stop()
-    } else {
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel()
-      if (audioRef.current) audioRef.current.pause()
-      setIsJarvisSpeaking(false)
-      setInterimTranscript('')
-      setFinalTranscript('')
-      try {
-        recognitionRef.current?.start()
-        setIsListening(true)
-      } catch (e) {
-        setError('Impossible de démarrer le micro.')
+  // ===== Capture audio + transcription Whisper (remplace Web Speech API) =====
+
+  // Démarre l'enregistrement via MediaRecorder
+  // Format laissé au navigateur : Chrome/Firefox -> webm/opus, iOS Safari -> mp4/AAC
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      mediaStreamRef.current = stream
+
+      const mr = new MediaRecorder(stream)
+      audioChunksRef.current = []
+
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
       }
+
+      mr.onstop = async () => {
+        // Libère le micro dès qu'on a stoppé - sinon icone micro de l'OS reste allumée
+        mediaStreamRef.current?.getTracks().forEach(t => t.stop())
+        mediaStreamRef.current = null
+
+        const mime = mr.mimeType || 'audio/webm'
+        const blob = new Blob(audioChunksRef.current, { type: mime })
+        audioChunksRef.current = []
+
+        if (blob.size < 500) {
+          // Quelques centaines d'octets = clic accidentel / pas de son
+          setError('Enregistrement trop court')
+          setIsProcessing(false)
+          return
+        }
+
+        await transcribeAndSend(blob, audioExtFromMime(mime))
+      }
+
+      mediaRecorderRef.current = mr
+      mr.start()
+      setIsListening(true)
+    } catch (err) {
+      // Permission refusée ou pas de micro disponible
+      setError(`Micro inaccessible : ${err.message || err.name}`)
+      setIsListening(false)
     }
   }
 
-  useEffect(() => {
-    if (!isListening && finalTranscript.trim()) {
-      const t = finalTranscript.trim()
-      setFinalTranscript('')
-      setInterimTranscript('')
-      sendToBackend(t)
+  const stopRecording = () => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop()  // déclenche mr.onstop async
+      setIsListening(false)
+      setIsProcessing(true)  // transition immédiate, on attend le résultat Whisper
     }
-  }, [isListening, finalTranscript, sendToBackend])
+  }
 
-  const liveTranscript = (finalTranscript + ' ' + interimTranscript).trim()
+  // Upload du blob audio à /transcribe puis enchaine sur le flow /chat existant
+  const transcribeAndSend = async (audioBlob, ext) => {
+    try {
+      const form = new FormData()
+      form.append('audio', audioBlob, `voice.${ext}`)
+
+      const res = await fetch(`${API_URL}/transcribe`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${auth.token}` },
+        body: form
+      })
+      if (res.status === 401) { onLogout(); return }
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.error || `Transcription HTTP ${res.status}`)
+      }
+      const { text } = await res.json()
+
+      if (!text?.trim()) {
+        setError("Je n'ai rien entendu, réessaie en parlant plus distinctement")
+        setIsProcessing(false)
+        return
+      }
+
+      // sendToBackend gère son propre isProcessing (déjà à true ici, no-op)
+      await sendToBackend(text)
+    } catch (err) {
+      setError(err.message)
+      setIsProcessing(false)
+    }
+  }
+
+  const toggleListening = () => {
+    setError(null)
+    if (isListening) {
+      stopRecording()
+    } else {
+      // Si Jarvis parle, on l'interrompt avant d'ouvrir le micro
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+      if (audioRef.current) audioRef.current.pause()
+      setIsJarvisSpeaking(false)
+      startRecording()
+    }
+  }
 
   const orbState = isJarvisSpeaking ? 'speaking'
                  : isListening ? 'listening'
@@ -498,9 +560,10 @@ export default function JarvisInterface({ auth, onLogout }) {
       <div className="fixed bottom-0 inset-x-0 z-20 pb-10 pt-8 pointer-events-none"
            style={{ background: 'linear-gradient(to top, #06060a 60%, transparent)' }}>
         <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-6 pointer-events-auto">
-          {isListening && liveTranscript && (
-            <div className="font-mono text-sm text-[#e8e8ec] text-center max-w-2xl px-4">
-              {liveTranscript}
+          {/* Indicateur d'enregistrement - Whisper ne stream pas, on affiche juste un signal visuel */}
+          {isListening && (
+            <div className="font-mono text-sm text-[#5b9eff] text-center">
+              Enregistrement
               <span className="cursor-blink text-[#5b9eff] ml-1">▊</span>
             </div>
           )}

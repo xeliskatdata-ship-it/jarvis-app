@@ -6,11 +6,13 @@ import cors from 'cors'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import dotenv from 'dotenv'
+import multer from 'multer'
 
 import { query, withTransaction } from './db.js'
 import { chat, chatWithTools } from './groq.js'
 import { getMemoriesContext, extractFacts } from './memory.js'
 import { tavilySearch, formatSearchForLLM } from './tavily.js'
+import { transcribe } from './whisper.js'
 
 dotenv.config({ path: '../.env' })
 
@@ -20,6 +22,12 @@ const PORT = process.env.PORT || 3001
 const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173').split(',')
 app.use(cors({ origin: allowedOrigins, credentials: true }))
 app.use(express.json({ limit: '1mb' }))
+
+// Whisper : audio reçu en multipart, gardé en mémoire (pas de disque), 25 Mo max (cap Groq)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }
+})
 
 // Prononciation forcée des prénoms - permet au TTS de bien épeler
 // 
@@ -266,6 +274,26 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
   }
 })
 
+// ====== TRANSCRIBE ROUTE ======
+// Audio -> texte via Whisper Groq. Le front rappellera ensuite /chat avec le texte obtenu.
+app.post('/transcribe', authRequired, upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Fichier audio manquant' })
+
+    const t0 = Date.now()
+    const text = await transcribe(req.file.buffer, {
+      filename: req.file.originalname || 'voice.webm',
+      language: 'fr'
+    })
+    console.log(`[transcribe] ${req.file.size}B -> "${text.slice(0, 60)}" (${Date.now() - t0}ms)`)
+
+    res.json({ text })
+  } catch (err) {
+    console.error('[/transcribe]', err)
+    res.status(500).json({ error: 'Erreur transcription', detail: err.message })
+  }
+})
+
 app.get('/history', authRequired, async (req, res) => {
   try {
     const conversationId = await getOrCreateConversation(req.user.id)
@@ -302,6 +330,7 @@ app.listen(PORT, () => {
   console.log(`\n=== Jarvis API ===`)
   console.log(`Port      : ${PORT}`)
   console.log(`LLM       : Groq`)
+  console.log(`Whisper   : whisper-large-v3-turbo (via Groq)`)
   console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
