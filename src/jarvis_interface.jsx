@@ -107,7 +107,8 @@ export default function JarvisInterface({ auth, onLogout }) {
 
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
-  const audioCtxRef = useRef(null)  // Web Audio API context - sert à unlock iOS Safari de manière robuste
+  const audioCtxRef = useRef(null)        // Web Audio API context - unlock iOS Safari de manière robuste
+  const audioSourceRef = useRef(null)     // BufferSource en cours de lecture - permet d'interrompre Jarvis
 
   // Refs MediaRecorder - on remplace Web Speech API par capture audio + transcription serveur Whisper
   const mediaRecorderRef = useRef(null)
@@ -210,9 +211,8 @@ export default function JarvisInterface({ auth, onLogout }) {
     window.speechSynthesis.speak(utt)
   }
 
+  // Fallback HTML5 Audio (utilisé si pas d'AudioContext - très rare)
   const playAudioUrl = (url) => {
-    // Réutilise l'élément Audio créé/débloqué dans le user gesture (toggleListening).
-    // Sans ça, iOS Safari bloque silencieusement audio.play() après plusieurs awaits.
     const audio = audioRef.current || new Audio()
     audioRef.current = audio
     audio.pause()
@@ -222,7 +222,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     audio.onended = () => setIsJarvisSpeaking(false)
     audio.onerror = () => {
       setIsJarvisSpeaking(false)
-      // Affiche l'erreur à l'écran (utile sur iPhone où la console est inaccessible)
       const code = audio.error?.code
       setError(`audio.onerror code=${code || '?'}`)
     }
@@ -235,25 +234,77 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  const synthesizeElevenLabs = async (text) => {
-    try {
-      const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
-        method: 'POST',
-        headers: { 'xi-api-key': elevenlabsKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-        body: JSON.stringify({
-          text,
-          model_id: 'eleven_multilingual_v2',
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-        })
-      })
-      if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
-      const blob = await res.blob()
+  // Lecture via Web Audio API - contourne les bugs HTML5 Audio sur iOS Safari
+  // Le mp3 ElevenLabs est décodé et joué directement par l'AudioContext (déjà débloqué au 1er clic micro)
+  const playWithAudioContext = async (blob) => {
+    const ctx = audioCtxRef.current
+    if (!ctx) {
+      // Pas d'AudioContext - fallback HTML5 Audio
       playAudioUrl(URL.createObjectURL(blob))
+      return
+    }
+
+    // Stop la lecture précédente s'il y en a une
+    if (audioSourceRef.current) {
+      try { audioSourceRef.current.stop() } catch {}
+      audioSourceRef.current = null
+    }
+
+    // iOS peut avoir suspendu le contexte entretemps (économie d'énergie)
+    if (ctx.state === 'suspended') {
+      try { await ctx.resume() } catch {}
+    }
+
+    try {
+      const arrayBuffer = await blob.arrayBuffer()
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer)
+
+      const source = ctx.createBufferSource()
+      source.buffer = audioBuffer
+      source.connect(ctx.destination)
+
+      setIsJarvisSpeaking(true)
+      source.onended = () => {
+        setIsJarvisSpeaking(false)
+        if (audioSourceRef.current === source) audioSourceRef.current = null
+      }
+
+      audioSourceRef.current = source
+      source.start(0)
     } catch (err) {
-      console.warn('TTS ElevenLabs échec, fallback navigateur:', err.message)
-      speakWithBrowser(text)
+      setIsJarvisSpeaking(false)
+      setError(`Web Audio: ${err.name} - ${(err.message || '').slice(0, 80)}`)
     }
   }
+
+  const synthesizeElevenLabs = async (text) => {
+  try {
+    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
+      method: 'POST',
+      headers: { 'xi-api-key': elevenlabsKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      })
+    })
+    if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
+    const blob = await res.blob()
+
+    // Web Audio API uniquement sur iOS (HTML5 Audio est cassé sur Safari iOS).
+    // Autres plateformes (Android, desktop) : chemin HTML5 d'origine qui marche déjà.
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    if (isIOS) {
+      await playWithAudioContext(blob)
+    } else {
+      playAudioUrl(URL.createObjectURL(blob))
+    }
+  } catch (err) {
+    console.warn('TTS ElevenLabs échec, fallback navigateur:', err.message)
+    speakWithBrowser(text)
+  }
+}
 
   // ===== Envoi au backend =====
   const sendToBackend = useCallback(async (text) => {
@@ -370,8 +421,7 @@ export default function JarvisInterface({ auth, onLogout }) {
   }
 
   // iOS Safari unlock - méthode robuste via Web Audio API
-  // Une fois l'AudioContext "réveillé" dans un user gesture, iOS débloque TOUT l'audio de la page
-  // (y compris les <audio> HTML5 utilisés ensuite pour ElevenLabs)
+  // Une fois l'AudioContext "réveillé" dans un user gesture, iOS débloque la lecture audio pour la page
   const unlockAudioIOS = () => {
     if (audioCtxRef.current) return  // déjà débloqué
 
@@ -392,10 +442,10 @@ export default function JarvisInterface({ auth, onLogout }) {
       // Web Audio API pas dispo - on continue avec l'unlock HTML Audio en backup
     }
 
-    // En complément, prépare l'élément Audio qui sera réutilisé pour la TTS
+    // En complément, prépare l'élément Audio HTML5 (utilisé en fallback uniquement)
     if (!audioRef.current) {
       const a = new Audio()
-      a.play().catch(() => {})  // tentative dans le gesture (même si rejette, l'élément est "touché")
+      a.play().catch(() => {})
       audioRef.current = a
     }
   }
@@ -405,9 +455,13 @@ export default function JarvisInterface({ auth, onLogout }) {
     if (isListening) {
       stopRecording()
     } else {
-      // Si Jarvis parle, on l'interrompt avant d'ouvrir le micro
+      // Si Jarvis parle, on l'interrompt - on stop la BufferSource Web Audio + l'Audio HTML5 fallback
       if ('speechSynthesis' in window) window.speechSynthesis.cancel()
       if (audioRef.current) audioRef.current.pause()
+      if (audioSourceRef.current) {
+        try { audioSourceRef.current.stop() } catch {}
+        audioSourceRef.current = null
+      }
       setIsJarvisSpeaking(false)
 
       // Unlock audio iOS DANS le user gesture - obligatoire pour que .play() marche plus tard
