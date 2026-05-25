@@ -64,6 +64,7 @@ const WEB_SEARCH_TOOL = {
 }
 
 // Outil minuteur - le déclenchement se fait côté client
+// duration_seconds en string : Llama 4 envoie souvent les nombres en string, on évite l'échec de validation Groq
 const SET_TIMER_TOOL = {
   type: 'function',
   function: {
@@ -79,8 +80,8 @@ Exemples :
       type: 'object',
       properties: {
         duration_seconds: {
-          type: 'integer',
-          description: 'Durée totale en secondes'
+          type: 'string',
+          description: 'Durée totale en secondes, en chiffres uniquement (ex: "300" pour 5 minutes, "3600" pour 1 heure)'
         },
         label: {
           type: 'string',
@@ -93,6 +94,7 @@ Exemples :
 }
 
 // Outil alarme - le déclenchement se fait à l'heure dite, côté client
+// hour/minute en string : même raison que set_timer
 const SET_ALARM_TOOL = {
   type: 'function',
   function: {
@@ -108,12 +110,12 @@ Exemples :
       type: 'object',
       properties: {
         hour: {
-          type: 'integer',
-          description: 'Heure (0-23, format 24h)'
+          type: 'string',
+          description: 'Heure en chiffres uniquement, format 24h (ex: "7", "14", "23")'
         },
         minute: {
-          type: 'integer',
-          description: 'Minute (0-59), 0 par défaut si non précisé'
+          type: 'string',
+          description: 'Minute en chiffres uniquement (ex: "30", "0"). "0" par défaut si non précisé'
         },
         label: {
           type: 'string',
@@ -302,16 +304,22 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
         const result = await tavilySearch(q, { depth: 'basic', maxResults: 4 })
         return formatSearchForLLM(result)
       },
-      // Le set_timer côté backend ne fait que confirmer au LLM - le vrai minuteur tourne côté navigateur
+      // set_timer côté backend : confirme juste au LLM - le vrai minuteur tourne côté navigateur
       set_timer: ({ duration_seconds, label }) => {
-        const min = Math.floor(duration_seconds / 60)
-        const sec = duration_seconds % 60
-        const durStr = min ? `${min} minute(s)${sec ? ` ${sec} seconde(s)` : ''}` : `${sec} seconde(s)`
+        // Llama envoie souvent les nombres en string - on parse défensivement
+        const sec = parseInt(duration_seconds, 10)
+        if (isNaN(sec) || sec <= 0) return 'Erreur: durée invalide.'
+        const m = Math.floor(sec / 60)
+        const s = sec % 60
+        const durStr = m ? `${m} minute(s)${s ? ` ${s} seconde(s)` : ''}` : `${s} seconde(s)`
         return `Minuteur démarré côté client pour ${durStr}${label ? ` (${label})` : ''}. Confirme brièvement et naturellement.`
       },
       set_alarm: ({ hour, minute, label }) => {
-        const m = (minute || 0).toString().padStart(2, '0')
-        return `Alarme programmée côté client à ${hour}h${m}${label ? ` (${label})` : ''}. Confirme brièvement et naturellement.`
+        const h = parseInt(hour, 10)
+        const min = parseInt(minute, 10) || 0
+        if (isNaN(h) || h < 0 || h > 23) return 'Erreur: heure invalide.'
+        const mStr = min.toString().padStart(2, '0')
+        return `Alarme programmée côté client à ${h}h${mStr}${label ? ` (${label})` : ''}. Confirme brièvement et naturellement.`
       }
     }
 
@@ -344,6 +352,7 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
     extractFacts(userId, transcript, rawReply).catch(e => console.warn('extract bg:', e.message))
 
     // Extrait les appels timer/alarm pour que le frontend puisse créer les vrais déclencheurs
+    // parseInt nécessaire : on stocke en string côté Groq mais le frontend attend des int
     const timerCall = toolsCalled.find(t => t.name === 'set_timer')
     const alarmCall = toolsCalled.find(t => t.name === 'set_alarm')
 
@@ -351,12 +360,12 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       reply,
       searched: toolsCalled.some(t => t.name === 'web_search'),
       timer: timerCall ? {
-        duration_seconds: timerCall.args.duration_seconds,
+        duration_seconds: parseInt(timerCall.args.duration_seconds, 10),
         label: timerCall.args.label || null
       } : null,
       alarm: alarmCall ? {
-        hour: alarmCall.args.hour,
-        minute: alarmCall.args.minute || 0,
+        hour: parseInt(alarmCall.args.hour, 10),
+        minute: parseInt(alarmCall.args.minute, 10) || 0,
         label: alarmCall.args.label || null
       } : null
     })
