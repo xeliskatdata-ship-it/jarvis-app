@@ -11,6 +11,10 @@ const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 
+// WAV silencieux ultra-court (data URI) - sert à "réveiller" l'élément Audio sur iOS Safari
+// dans un user gesture, sinon les .play() ultérieurs après awaits sont bloqués
+const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA='
+
 // Mappe le mimeType MediaRecorder vers une extension acceptée par Groq Whisper
 // iOS Safari ne supporte pas webm, il enregistre en audio/mp4 (AAC) - on s'adapte
 function audioExtFromMime(mimeType) {
@@ -210,9 +214,13 @@ export default function JarvisInterface({ auth, onLogout }) {
   }
 
   const playAudioUrl = (url) => {
-    if (audioRef.current) audioRef.current.pause()
-    const audio = new Audio(url)
+    // Réutilise l'élément Audio créé/débloqué dans le user gesture (toggleListening).
+    // Sans ça, iOS Safari bloque silencieusement audio.play() après plusieurs awaits.
+    const audio = audioRef.current || new Audio()
     audioRef.current = audio
+    audio.pause()
+    audio.volume = 1  // restaure le volume (l'unlock l'avait mis à 0)
+    audio.src = url
     audio.onplay = () => setIsJarvisSpeaking(true)
     audio.onended = () => setIsJarvisSpeaking(false)
     audio.onerror = () => setIsJarvisSpeaking(false)
@@ -362,6 +370,17 @@ export default function JarvisInterface({ auth, onLogout }) {
       if ('speechSynthesis' in window) window.speechSynthesis.cancel()
       if (audioRef.current) audioRef.current.pause()
       setIsJarvisSpeaking(false)
+
+      // iOS Safari unlock : on "réveille" un élément Audio DANS le user gesture (clic).
+      // Sans ça, le .play() ultérieur (après transcribe + chat + elevenlabs) est bloqué sur iPhone.
+      // No-op sur les autres navigateurs.
+      if (!audioRef.current) {
+        const a = new Audio(SILENT_WAV)
+        a.volume = 0
+        a.play().catch(() => {})  // peut rejeter, peu importe : la tentative dans le gesture suffit
+        audioRef.current = a
+      }
+
       startRecording()
     }
   }
