@@ -11,10 +11,6 @@ const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 
-// WAV silencieux ultra-court (data URI) - sert à "réveiller" l'élément Audio sur iOS Safari
-// dans un user gesture, sinon les .play() ultérieurs après awaits sont bloqués
-const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA='
-
 // Mappe le mimeType MediaRecorder vers une extension acceptée par Groq Whisper
 // iOS Safari ne supporte pas webm, il enregistre en audio/mp4 (AAC) - on s'adapte
 function audioExtFromMime(mimeType) {
@@ -111,6 +107,7 @@ export default function JarvisInterface({ auth, onLogout }) {
 
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
+  const audioCtxRef = useRef(null)  // Web Audio API context - sert à unlock iOS Safari de manière robuste
 
   // Refs MediaRecorder - on remplace Web Speech API par capture audio + transcription serveur Whisper
   const mediaRecorderRef = useRef(null)
@@ -219,12 +216,23 @@ export default function JarvisInterface({ auth, onLogout }) {
     const audio = audioRef.current || new Audio()
     audioRef.current = audio
     audio.pause()
-    audio.volume = 1  // restaure le volume (l'unlock l'avait mis à 0)
+    audio.volume = 1
     audio.src = url
     audio.onplay = () => setIsJarvisSpeaking(true)
     audio.onended = () => setIsJarvisSpeaking(false)
-    audio.onerror = () => setIsJarvisSpeaking(false)
-    audio.play().catch(e => { console.warn('Audio bloqué:', e.message); setIsJarvisSpeaking(false) })
+    audio.onerror = () => {
+      setIsJarvisSpeaking(false)
+      // Affiche l'erreur à l'écran (utile sur iPhone où la console est inaccessible)
+      const code = audio.error?.code
+      setError(`audio.onerror code=${code || '?'}`)
+    }
+    const playPromise = audio.play()
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(err => {
+        setIsJarvisSpeaking(false)
+        setError(`play() bloqué: ${err.name} - ${(err.message || '').slice(0, 80)}`)
+      })
+    }
   }
 
   const synthesizeElevenLabs = async (text) => {
@@ -361,6 +369,37 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
+  // iOS Safari unlock - méthode robuste via Web Audio API
+  // Une fois l'AudioContext "réveillé" dans un user gesture, iOS débloque TOUT l'audio de la page
+  // (y compris les <audio> HTML5 utilisés ensuite pour ElevenLabs)
+  const unlockAudioIOS = () => {
+    if (audioCtxRef.current) return  // déjà débloqué
+
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext
+      if (Ctx) {
+        const ctx = new Ctx()
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {})
+        // Joue un buffer silencieux 1 sample - active la chaîne audio iOS
+        const buffer = ctx.createBuffer(1, 1, 22050)
+        const source = ctx.createBufferSource()
+        source.buffer = buffer
+        source.connect(ctx.destination)
+        source.start(0)
+        audioCtxRef.current = ctx
+      }
+    } catch (e) {
+      // Web Audio API pas dispo - on continue avec l'unlock HTML Audio en backup
+    }
+
+    // En complément, prépare l'élément Audio qui sera réutilisé pour la TTS
+    if (!audioRef.current) {
+      const a = new Audio()
+      a.play().catch(() => {})  // tentative dans le gesture (même si rejette, l'élément est "touché")
+      audioRef.current = a
+    }
+  }
+
   const toggleListening = () => {
     setError(null)
     if (isListening) {
@@ -371,15 +410,8 @@ export default function JarvisInterface({ auth, onLogout }) {
       if (audioRef.current) audioRef.current.pause()
       setIsJarvisSpeaking(false)
 
-      // iOS Safari unlock : on "réveille" un élément Audio DANS le user gesture (clic).
-      // Sans ça, le .play() ultérieur (après transcribe + chat + elevenlabs) est bloqué sur iPhone.
-      // No-op sur les autres navigateurs.
-      if (!audioRef.current) {
-        const a = new Audio(SILENT_WAV)
-        a.volume = 0
-        a.play().catch(() => {})  // peut rejeter, peu importe : la tentative dans le gesture suffit
-        audioRef.current = a
-      }
+      // Unlock audio iOS DANS le user gesture - obligatoire pour que .play() marche plus tard
+      unlockAudioIOS()
 
       startRecording()
     }
