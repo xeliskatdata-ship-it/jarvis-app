@@ -2,17 +2,12 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
-
-// George - voix masculine UK posh, signature Jarvis-like
 const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb'
-
-// Nombre de messages affichés à l'écran - le contexte LLM reste plus large côté backend
 const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 const eventsKey = (userId) => `jarvis_events_${userId}`
 
-// Mappe le mimeType MediaRecorder vers une extension acceptée par Groq Whisper
 function audioExtFromMime(mimeType) {
   if (!mimeType) return 'webm'
   if (mimeType.includes('webm')) return 'webm'
@@ -21,7 +16,6 @@ function audioExtFromMime(mimeType) {
   return 'webm'
 }
 
-// ========== Composant JarvisOrb (SVG animé) ==========
 function JarvisOrb({ state = 'idle', size = 180 }) {
   const segments = Array.from({ length: 48 })
   return (
@@ -78,7 +72,6 @@ function JarvisOrb({ state = 'idle', size = 180 }) {
   )
 }
 
-// Formate une durée restante (ms) en mm:ss ou h:mm:ss
 function formatRemaining(ms) {
   if (ms <= 0) return '0:00'
   const totalSec = Math.ceil(ms / 1000)
@@ -94,7 +87,6 @@ function formatAlarmTime(ts) {
   return `${d.getHours().toString().padStart(2, '0')}h${d.getMinutes().toString().padStart(2, '0')}`
 }
 
-// ========== Composant principal ==========
 export default function JarvisInterface({ auth, onLogout }) {
   const [messages, setMessages] = useState([])
   const [isListening, setIsListening] = useState(false)
@@ -112,17 +104,23 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [notification, setNotification] = useState(null)
   const [now, setNow] = useState(Date.now())
 
+  // État de l'autorisation des notifications système (granted / denied / default / unsupported)
+  const [notifPermission, setNotifPermission] = useState(
+    typeof window !== 'undefined' && 'Notification' in window
+      ? Notification.permission
+      : 'unsupported'
+  )
+
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
   const audioCtxRef = useRef(null)
   const audioSourceRef = useRef(null)
-  const beepIntervalRef = useRef(null)  // boucle de bips pour minuteur/alarme - tourne tant que notification active
+  const beepIntervalRef = useRef(null)
 
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
   const mediaStreamRef = useRef(null)
 
-  // Taille orb responsive
   useEffect(() => {
     const computeOrbSize = () => {
       const w = window.innerWidth
@@ -135,7 +133,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     return () => window.removeEventListener('resize', computeOrbSize)
   }, [])
 
-  // Charge prefs user
   useEffect(() => {
     const stored = localStorage.getItem(prefsKey(auth.user.id))
     if (stored) {
@@ -151,7 +148,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     localStorage.setItem(prefsKey(auth.user.id), JSON.stringify({ elevenlabsKey, elevenlabsVoiceId }))
   }, [auth.user.id, elevenlabsKey, elevenlabsVoiceId])
 
-  // Charge events (timers + alarmes) depuis localStorage - filtre ceux déjà expirés
   useEffect(() => {
     const stored = localStorage.getItem(eventsKey(auth.user.id))
     if (stored) {
@@ -167,7 +163,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     localStorage.setItem(eventsKey(auth.user.id), JSON.stringify(events))
   }, [events, auth.user.id])
 
-  // Cleanup à l'unmount : libère le micro + arrête la boucle de bips si en cours
   useEffect(() => {
     return () => {
       if (mediaRecorderRef.current?.state === 'recording') {
@@ -185,7 +180,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [])
 
-  // Charge l'historique au login
   useEffect(() => {
     const loadHistory = async () => {
       try {
@@ -214,7 +208,42 @@ export default function JarvisInterface({ auth, onLogout }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isProcessing])
 
-  // Joue 3 beeps via Web Audio API - briquette de base de la sonnerie
+  // Demande l'autorisation des notifications système - doit être appelée dans un user gesture (Safari)
+  const requestNotifPermission = async () => {
+    if (!('Notification' in window)) return
+    if (Notification.permission !== 'default') return  // déjà décidé une fois, on insiste pas
+    try {
+      const result = await Notification.requestPermission()
+      setNotifPermission(result)
+    } catch (e) {
+      // ancien navigateurs : requestPermission n'était pas une promise
+    }
+  }
+
+  // Envoie une vraie notif OS si l'utilisateur a accordé la permission - silencieux sinon
+  const sendSystemNotification = (message) => {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return
+    // Split "Minuteur terminé : pâtes" en titre + body pour un meilleur rendu OS
+    const [titlePart, ...bodyParts] = message.split(' : ')
+    const body = bodyParts.length > 0
+      ? bodyParts.join(' : ')
+      : 'Reviens sur Jarvis pour arrêter la sonnerie'
+    try {
+      const notif = new Notification(`Jarvis — ${titlePart}`, {
+        body,
+        tag: 'jarvis-alarm',          // remplace toute notif précédente du même tag
+        requireInteraction: true,      // reste visible sur desktop jusqu'au clic
+        vibrate: [200, 100, 200, 100, 200]
+      })
+      notif.onclick = () => {
+        window.focus()  // ramène l'onglet au premier plan
+        notif.close()
+      }
+    } catch (e) {
+      // certains navigateurs throw si appelé depuis un onglet en arrière-plan sans permission
+    }
+  }
+
   const playBeep = () => {
     const ctx = audioCtxRef.current
     if (!ctx) return
@@ -236,10 +265,9 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // Démarre la boucle de bips (toutes les 2.2s) - tourne jusqu'à dismissNotification
   const startBeepLoop = () => {
-    if (beepIntervalRef.current) clearInterval(beepIntervalRef.current)  // safety : pas de double-loop
-    playBeep()  // 1er bip immédiat
+    if (beepIntervalRef.current) clearInterval(beepIntervalRef.current)
+    playBeep()
     beepIntervalRef.current = setInterval(playBeep, 2200)
   }
 
@@ -250,19 +278,18 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // Déclenche notification (sonnerie répétitive + banner) - reste actif jusqu'à dismiss explicite
+  // Déclenche tout : bips répétés + banner + notif OS (si permission accordée)
   const fireNotification = (message) => {
     startBeepLoop()
     setNotification(message)
+    sendSystemNotification(message)
   }
 
-  // Arrête tout d'un coup : la boucle de bips + le banner
   const dismissNotification = () => {
     stopBeepLoop()
     setNotification(null)
   }
 
-  // Tick toutes les secondes : met à jour `now` + déclenche les events échus
   useEffect(() => {
     const tick = () => {
       const t = Date.now()
@@ -299,7 +326,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     setEvents(prev => prev.filter(e => e.id !== id))
   }
 
-  // ===== TTS avec tracking speaking state =====
   const speakWithBrowser = (text) => {
     if (!('speechSynthesis' in window)) return
     window.speechSynthesis.cancel()
@@ -400,7 +426,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // ===== Envoi au backend =====
   const sendToBackend = useCallback(async (text) => {
     if (!text.trim()) return
     setMessages(prev => [...prev, { role: 'user', content: text, ts: Date.now() }])
@@ -433,7 +458,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [auth.token, elevenlabsKey, elevenlabsVoiceId, onLogout])
 
-  // ===== Capture audio + transcription Whisper =====
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -504,7 +528,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // iOS Safari unlock via Web Audio API
   const unlockAudioIOS = () => {
     if (audioCtxRef.current) return
     try {
@@ -539,7 +562,9 @@ export default function JarvisInterface({ auth, onLogout }) {
         audioSourceRef.current = null
       }
       setIsJarvisSpeaking(false)
+      // Le premier clic micro = bon moment pour unlock audio iOS ET demander permission notif (user gesture)
       unlockAudioIOS()
+      requestNotifPermission()
       startRecording()
     }
   }
@@ -646,7 +671,6 @@ export default function JarvisInterface({ auth, onLogout }) {
            style={{ background: 'radial-gradient(circle at 50% 30%, rgba(91,158,255,0.08), transparent 60%)' }} />
       <div className="absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-[#5b9eff]/30 to-transparent scan-line pointer-events-none" />
 
-      {/* Notification banner - apparaît quand minuteur/alarme se déclenche, reste jusqu'au dismiss */}
       {notification && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-full bg-[#5b9eff] text-[#06060a] font-mono text-sm font-medium msg-in shadow-2xl alarm-pulse">
           <Bell size={16} />
@@ -727,7 +751,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         <div ref={messagesEndRef} />
       </main>
 
-      {/* Pills flottantes : minuteurs + alarmes actifs */}
       {events.length > 0 && (
         <div className="fixed bottom-44 left-6 z-30 space-y-2 max-w-[280px]">
           {events.map(e => (
@@ -750,7 +773,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         </div>
       )}
 
-      {/* Barre micro fixe */}
       <div className="fixed bottom-0 inset-x-0 z-20 pb-10 pt-8 pointer-events-none"
            style={{ background: 'linear-gradient(to top, #06060a 60%, transparent)' }}>
         <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-4 pointer-events-auto">
@@ -789,7 +811,6 @@ export default function JarvisInterface({ auth, onLogout }) {
             </button>
           </div>
 
-          {/* Bouton "Arrêter la sonnerie" - visible UNIQUEMENT quand une alarme/minuteur sonne */}
           {notification && (
             <button
               onClick={dismissNotification}
@@ -808,7 +829,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         </div>
       </div>
 
-      {/* Modal Settings */}
       {showSettings && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm msg-in"
@@ -823,7 +843,7 @@ export default function JarvisInterface({ auth, onLogout }) {
 
             <h2 className="font-display text-2xl italic mb-1">Configuration</h2>
             <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#6b6b78] mb-8">
-              voix · session
+              voix · session · notifications
             </p>
 
             <div className="space-y-5">
@@ -854,6 +874,18 @@ export default function JarvisInterface({ auth, onLogout }) {
                 <p className="font-mono text-[10px] text-[#6b6b78] mt-2">
                   George (UK, défaut) · Daniel: onwK4e9ZLuTAKqWW03F9 · Adam: pNInz6obpgDQGcFmaJgB
                 </p>
+              </div>
+
+              <div className="pt-4 border-t border-white/5">
+                <label className="block font-mono text-[10px] uppercase tracking-[0.2em] text-[#6b6b78] mb-2">
+                  Notifications système
+                </label>
+                <div className="px-4 py-3 rounded-lg bg-black/40 border border-white/10 font-mono text-xs">
+                  {notifPermission === 'granted' && <span className="text-green-400">✓ Activées — tu seras prévenue même onglet en arrière-plan</span>}
+                  {notifPermission === 'denied' && <span className="text-red-300">✗ Bloquées — autorise-les dans les réglages du navigateur pour ce site</span>}
+                  {notifPermission === 'default' && <span className="text-[#6b6b78]">⋯ Pas encore demandées — clique sur le micro pour activer</span>}
+                  {notifPermission === 'unsupported' && <span className="text-[#6b6b78]">Non supportées par ce navigateur</span>}
+                </div>
               </div>
 
               <div className="pt-4 border-t border-white/5 space-y-2">
