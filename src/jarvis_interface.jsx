@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Mic, Settings, X, AlertCircle, LogOut } from 'lucide-react'
+import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell } from 'lucide-react'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
@@ -10,9 +10,9 @@ const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb'
 const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
+const eventsKey = (userId) => `jarvis_events_${userId}`
 
 // Mappe le mimeType MediaRecorder vers une extension acceptée par Groq Whisper
-// iOS Safari ne supporte pas webm, il enregistre en audio/mp4 (AAC) - on s'adapte
 function audioExtFromMime(mimeType) {
   if (!mimeType) return 'webm'
   if (mimeType.includes('webm')) return 'webm'
@@ -22,7 +22,6 @@ function audioExtFromMime(mimeType) {
 }
 
 // ========== Composant JarvisOrb (SVG animé) ==========
-// state: 'idle' (breathing) | 'listening' (user parle) | 'speaking' (Jarvis parle)
 function JarvisOrb({ state = 'idle', size = 180 }) {
   const segments = Array.from({ length: 48 })
   return (
@@ -43,8 +42,6 @@ function JarvisOrb({ state = 'idle', size = 180 }) {
             </feMerge>
           </filter>
         </defs>
-
-        {/* Outer rotating ring with radial tick segments */}
         <g className="orb-outer" filter="url(#orbGlow)">
           {segments.map((_, i) => {
             const long = i % 6 === 0
@@ -61,13 +58,9 @@ function JarvisOrb({ state = 'idle', size = 180 }) {
             )
           })}
         </g>
-
-        {/* Middle dashed ring */}
         <circle cx="100" cy="100" r="70" fill="none"
                 stroke="#5b9eff" strokeOpacity="0.35"
                 strokeWidth="1" strokeDasharray="2 6" />
-
-        {/* Counter-rotating accent arc */}
         <g className="orb-arc">
           <path d="M 100 35 A 65 65 0 0 1 165 100"
                 stroke="#5b9eff" strokeWidth="2.5" fill="none"
@@ -76,19 +69,30 @@ function JarvisOrb({ state = 'idle', size = 180 }) {
                 stroke="#5b9eff" strokeWidth="1.5" fill="none"
                 strokeOpacity="0.5" strokeLinecap="round" />
         </g>
-
-        {/* Inner static ring */}
         <circle cx="100" cy="100" r="48" fill="none"
                 stroke="#5b9eff" strokeOpacity="0.6" strokeWidth="1.5" />
-
-        {/* Core luminous - le coeur qui pulse */}
         <circle cx="100" cy="100" r="42" fill="url(#orbCoreGrad)" className="orb-core" />
-
-        {/* Center dot */}
         <circle cx="100" cy="100" r="2" fill="#ffffff" opacity="0.9" />
       </svg>
     </div>
   )
+}
+
+// Formate une durée restante (ms) en mm:ss ou h:mm:ss
+function formatRemaining(ms) {
+  if (ms <= 0) return '0:00'
+  const totalSec = Math.ceil(ms / 1000)
+  const h = Math.floor(totalSec / 3600)
+  const m = Math.floor((totalSec % 3600) / 60)
+  const s = totalSec % 60
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+// Formate un timestamp en heure de la journée (HHhmm)
+function formatAlarmTime(ts) {
+  const d = new Date(ts)
+  return `${d.getHours().toString().padStart(2, '0')}h${d.getMinutes().toString().padStart(2, '0')}`
 }
 
 // ========== Composant principal ==========
@@ -100,29 +104,32 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [showSettings, setShowSettings] = useState(false)
   const [error, setError] = useState(null)
   const [historyLoaded, setHistoryLoaded] = useState(false)
-  const [orbSize, setOrbSize] = useState(550)  // responsive : recalculé selon viewport
+  const [orbSize, setOrbSize] = useState(550)
 
   const [elevenlabsKey, setElevenlabsKey] = useState('')
   const [elevenlabsVoiceId, setElevenlabsVoiceId] = useState(DEFAULT_VOICE_ID)
 
+  // Minuteurs + alarmes actifs - chaque event = { id, type, firesAt, label }
+  const [events, setEvents] = useState([])
+  const [notification, setNotification] = useState(null)  // string ou null
+  const [now, setNow] = useState(Date.now())  // refresh pour les countdowns
+
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
-  const audioCtxRef = useRef(null)        // Web Audio API context - unlock iOS Safari de manière robuste
-  const audioSourceRef = useRef(null)     // BufferSource en cours de lecture - permet d'interrompre Jarvis
+  const audioCtxRef = useRef(null)
+  const audioSourceRef = useRef(null)
 
-  // Refs MediaRecorder - on remplace Web Speech API par capture audio + transcription serveur Whisper
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
   const mediaStreamRef = useRef(null)
 
-  // Calcul de la taille de l'orb selon le viewport - responsive desktop/tablet/mobile
+  // Taille orb responsive
   useEffect(() => {
     const computeOrbSize = () => {
       const w = window.innerWidth
       const h = window.innerHeight
-      // Max raisonnable : 60% de la dimension la plus petite, capé à 600
       const max = Math.min(w * 0.6, h * 0.55, 600)
-      setOrbSize(Math.max(220, Math.floor(max)))  // minimum 220 sur très petit écran
+      setOrbSize(Math.max(220, Math.floor(max)))
     }
     computeOrbSize()
     window.addEventListener('resize', computeOrbSize)
@@ -145,7 +152,24 @@ export default function JarvisInterface({ auth, onLogout }) {
     localStorage.setItem(prefsKey(auth.user.id), JSON.stringify({ elevenlabsKey, elevenlabsVoiceId }))
   }, [auth.user.id, elevenlabsKey, elevenlabsVoiceId])
 
-  // Cleanup à l'unmount : libère le micro si toujours actif (sinon icone micro reste allumée dans l'OS)
+  // Charge events (timers + alarmes) depuis localStorage - filtre ceux déjà expirés
+  useEffect(() => {
+    const stored = localStorage.getItem(eventsKey(auth.user.id))
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        const t = Date.now()
+        setEvents(parsed.filter(e => e.firesAt > t))
+      } catch {}
+    }
+  }, [auth.user.id])
+
+  // Sauvegarde events à chaque changement
+  useEffect(() => {
+    localStorage.setItem(eventsKey(auth.user.id), JSON.stringify(events))
+  }, [events, auth.user.id])
+
+  // Cleanup à l'unmount : libère le micro si toujours actif
   useEffect(() => {
     return () => {
       if (mediaRecorderRef.current?.state === 'recording') {
@@ -191,6 +215,81 @@ export default function JarvisInterface({ auth, onLogout }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isProcessing])
 
+  // Joue 3 beeps via Web Audio API - sonnerie de minuteur/alarme
+  const playBeep = () => {
+    const ctx = audioCtxRef.current
+    if (!ctx) return
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {})
+
+    const start = ctx.currentTime
+    for (let i = 0; i < 3; i++) {
+      const t = start + i * 0.4
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.frequency.value = 880
+      osc.type = 'sine'
+      gain.gain.setValueAtTime(0, t)
+      gain.gain.linearRampToValueAtTime(0.3, t + 0.02)  // attack rapide
+      gain.gain.linearRampToValueAtTime(0, t + 0.3)    // release
+      osc.connect(gain).connect(ctx.destination)
+      osc.start(t)
+      osc.stop(t + 0.3)
+    }
+  }
+
+  // Déclenche notification visuelle + sonore
+  const fireNotification = (message) => {
+    playBeep()
+    setNotification(message)
+  }
+
+  // Auto-dismiss notification après 10s
+  useEffect(() => {
+    if (!notification) return
+    const id = setTimeout(() => setNotification(null), 10000)
+    return () => clearTimeout(id)
+  }, [notification])
+
+  // Tick toutes les secondes : met à jour `now` + déclenche les events échus
+  useEffect(() => {
+    const tick = () => {
+      const t = Date.now()
+      setNow(t)
+      setEvents(prev => {
+        const due = prev.filter(e => e.firesAt <= t)
+        if (due.length === 0) return prev
+        due.forEach(e => {
+          const base = e.type === 'timer' ? 'Minuteur terminé' : 'Alarme'
+          fireNotification(`${base}${e.label ? ` : ${e.label}` : ''}`)
+        })
+        return prev.filter(e => e.firesAt > t)
+      })
+    }
+    const intervalId = setInterval(tick, 1000)
+    return () => clearInterval(intervalId)
+  }, [])
+
+  // Ajoute un minuteur (durée en secondes)
+  const addTimer = (durationSeconds, label) => {
+    const id = `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const firesAt = Date.now() + durationSeconds * 1000
+    setEvents(prev => [...prev, { id, type: 'timer', firesAt, label: label || null }])
+  }
+
+  // Ajoute une alarme (heure dans la journée, demain si déjà passée)
+  const addAlarm = (hour, minute, label) => {
+    const target = new Date()
+    target.setHours(hour, minute || 0, 0, 0)
+    if (target <= new Date()) target.setDate(target.getDate() + 1)
+    const id = `a_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    setEvents(prev => [...prev, { id, type: 'alarm', firesAt: target.getTime(), label: label || null }])
+  }
+
+  // Annule un event (clic sur la croix)
+  const cancelEvent = (id) => {
+    setEvents(prev => prev.filter(e => e.id !== id))
+  }
+
   // ===== TTS avec tracking speaking state =====
   const speakWithBrowser = (text) => {
     if (!('speechSynthesis' in window)) return
@@ -211,7 +310,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     window.speechSynthesis.speak(utt)
   }
 
-  // Fallback HTML5 Audio (utilisé si pas d'AudioContext - très rare)
   const playAudioUrl = (url) => {
     const audio = audioRef.current || new Audio()
     audioRef.current = audio
@@ -234,41 +332,30 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // Lecture via Web Audio API - contourne les bugs HTML5 Audio sur iOS Safari
-  // Le mp3 ElevenLabs est décodé et joué directement par l'AudioContext (déjà débloqué au 1er clic micro)
   const playWithAudioContext = async (blob) => {
     const ctx = audioCtxRef.current
     if (!ctx) {
-      // Pas d'AudioContext - fallback HTML5 Audio
       playAudioUrl(URL.createObjectURL(blob))
       return
     }
-
-    // Stop la lecture précédente s'il y en a une
     if (audioSourceRef.current) {
       try { audioSourceRef.current.stop() } catch {}
       audioSourceRef.current = null
     }
-
-    // iOS peut avoir suspendu le contexte entretemps (économie d'énergie)
     if (ctx.state === 'suspended') {
       try { await ctx.resume() } catch {}
     }
-
     try {
       const arrayBuffer = await blob.arrayBuffer()
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer)
-
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
       source.connect(ctx.destination)
-
       setIsJarvisSpeaking(true)
       source.onended = () => {
         setIsJarvisSpeaking(false)
         if (audioSourceRef.current === source) audioSourceRef.current = null
       }
-
       audioSourceRef.current = source
       source.start(0)
     } catch (err) {
@@ -278,33 +365,32 @@ export default function JarvisInterface({ auth, onLogout }) {
   }
 
   const synthesizeElevenLabs = async (text) => {
-  try {
-    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
-      method: 'POST',
-      headers: { 'xi-api-key': elevenlabsKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+    try {
+      const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
+        method: 'POST',
+        headers: { 'xi-api-key': elevenlabsKey, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        })
       })
-    })
-    if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
-    const blob = await res.blob()
+      if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
+      const blob = await res.blob()
 
-    // Web Audio API uniquement sur iOS (HTML5 Audio est cassé sur Safari iOS).
-    // Autres plateformes (Android, desktop) : chemin HTML5 d'origine qui marche déjà.
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-    if (isIOS) {
-      await playWithAudioContext(blob)
-    } else {
-      playAudioUrl(URL.createObjectURL(blob))
+      // Web Audio API uniquement sur iOS, HTML5 Audio sur les autres
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+      if (isIOS) {
+        await playWithAudioContext(blob)
+      } else {
+        playAudioUrl(URL.createObjectURL(blob))
+      }
+    } catch (err) {
+      console.warn('TTS ElevenLabs échec, fallback navigateur:', err.message)
+      speakWithBrowser(text)
     }
-  } catch (err) {
-    console.warn('TTS ElevenLabs échec, fallback navigateur:', err.message)
-    speakWithBrowser(text)
   }
-}
 
   // ===== Envoi au backend =====
   const sendToBackend = useCallback(async (text) => {
@@ -326,6 +412,11 @@ export default function JarvisInterface({ auth, onLogout }) {
       const data = await res.json()
       const reply = data.reply || "Pas de réponse reçue."
       setMessages(prev => [...prev, { role: 'jarvis', content: reply, ts: Date.now() }])
+
+      // Si la LLM a déclenché set_timer ou set_alarm, on crée le vrai event côté client
+      if (data.timer) addTimer(data.timer.duration_seconds, data.timer.label)
+      if (data.alarm) addAlarm(data.alarm.hour, data.alarm.minute, data.alarm.label)
+
       if (elevenlabsKey) await synthesizeElevenLabs(reply)
       else speakWithBrowser(reply)
     } catch (err) {
@@ -335,10 +426,7 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [auth.token, elevenlabsKey, elevenlabsVoiceId, onLogout])
 
-  // ===== Capture audio + transcription Whisper (remplace Web Speech API) =====
-
-  // Démarre l'enregistrement via MediaRecorder
-  // Format laissé au navigateur : Chrome/Firefox -> webm/opus, iOS Safari -> mp4/AAC
+  // ===== Capture audio + transcription Whisper =====
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -352,21 +440,16 @@ export default function JarvisInterface({ auth, onLogout }) {
       }
 
       mr.onstop = async () => {
-        // Libère le micro dès qu'on a stoppé - sinon icone micro de l'OS reste allumée
         mediaStreamRef.current?.getTracks().forEach(t => t.stop())
         mediaStreamRef.current = null
-
         const mime = mr.mimeType || 'audio/webm'
         const blob = new Blob(audioChunksRef.current, { type: mime })
         audioChunksRef.current = []
-
         if (blob.size < 500) {
-          // Quelques centaines d'octets = clic accidentel / pas de son
           setError('Enregistrement trop court')
           setIsProcessing(false)
           return
         }
-
         await transcribeAndSend(blob, audioExtFromMime(mime))
       }
 
@@ -374,7 +457,6 @@ export default function JarvisInterface({ auth, onLogout }) {
       mr.start()
       setIsListening(true)
     } catch (err) {
-      // Permission refusée ou pas de micro disponible
       setError(`Micro inaccessible : ${err.message || err.name}`)
       setIsListening(false)
     }
@@ -382,18 +464,16 @@ export default function JarvisInterface({ auth, onLogout }) {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop()  // déclenche mr.onstop async
+      mediaRecorderRef.current.stop()
       setIsListening(false)
-      setIsProcessing(true)  // transition immédiate, on attend le résultat Whisper
+      setIsProcessing(true)
     }
   }
 
-  // Upload du blob audio à /transcribe puis enchaine sur le flow /chat existant
   const transcribeAndSend = async (audioBlob, ext) => {
     try {
       const form = new FormData()
       form.append('audio', audioBlob, `voice.${ext}`)
-
       const res = await fetch(`${API_URL}/transcribe`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${auth.token}` },
@@ -405,14 +485,11 @@ export default function JarvisInterface({ auth, onLogout }) {
         throw new Error(errData.error || `Transcription HTTP ${res.status}`)
       }
       const { text } = await res.json()
-
       if (!text?.trim()) {
         setError("Je n'ai rien entendu, réessaie en parlant plus distinctement")
         setIsProcessing(false)
         return
       }
-
-      // sendToBackend gère son propre isProcessing (déjà à true ici, no-op)
       await sendToBackend(text)
     } catch (err) {
       setError(err.message)
@@ -420,17 +497,14 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // iOS Safari unlock - méthode robuste via Web Audio API
-  // Une fois l'AudioContext "réveillé" dans un user gesture, iOS débloque la lecture audio pour la page
+  // iOS Safari unlock via Web Audio API
   const unlockAudioIOS = () => {
-    if (audioCtxRef.current) return  // déjà débloqué
-
+    if (audioCtxRef.current) return
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext
       if (Ctx) {
         const ctx = new Ctx()
         if (ctx.state === 'suspended') ctx.resume().catch(() => {})
-        // Joue un buffer silencieux 1 sample - active la chaîne audio iOS
         const buffer = ctx.createBuffer(1, 1, 22050)
         const source = ctx.createBufferSource()
         source.buffer = buffer
@@ -438,11 +512,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         source.start(0)
         audioCtxRef.current = ctx
       }
-    } catch (e) {
-      // Web Audio API pas dispo - on continue avec l'unlock HTML Audio en backup
-    }
-
-    // En complément, prépare l'élément Audio HTML5 (utilisé en fallback uniquement)
+    } catch (e) {}
     if (!audioRef.current) {
       const a = new Audio()
       a.play().catch(() => {})
@@ -455,7 +525,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     if (isListening) {
       stopRecording()
     } else {
-      // Si Jarvis parle, on l'interrompt - on stop la BufferSource Web Audio + l'Audio HTML5 fallback
       if ('speechSynthesis' in window) window.speechSynthesis.cancel()
       if (audioRef.current) audioRef.current.pause()
       if (audioSourceRef.current) {
@@ -463,10 +532,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         audioSourceRef.current = null
       }
       setIsJarvisSpeaking(false)
-
-      // Unlock audio iOS DANS le user gesture - obligatoire pour que .play() marche plus tard
       unlockAudioIOS()
-
       startRecording()
     }
   }
@@ -482,8 +548,6 @@ export default function JarvisInterface({ auth, onLogout }) {
                     : `bonjour ${auth.user.name.toLowerCase()}`
 
   const isEmpty = historyLoaded && messages.length === 0 && !isProcessing
-
-  // N'affiche que les N derniers messages - le contexte complet reste côté serveur
   const visibleMessages = messages.slice(-VISIBLE_MESSAGES)
 
   return (
@@ -528,7 +592,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         .glow-accent { box-shadow: 0 0 40px rgba(91,158,255,0.4), inset 0 0 20px rgba(91,158,255,0.1); }
         .glow-text { text-shadow: 0 0 20px rgba(91,158,255,0.5); }
 
-        /* ====== Jarvis Orb animations ====== */
         @keyframes orb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes orb-spin-reverse { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
         @keyframes orb-core-breathe {
@@ -547,29 +610,16 @@ export default function JarvisInterface({ auth, onLogout }) {
         }
 
         .jarvis-orb { position: relative; display: inline-block; }
-        .jarvis-orb .orb-outer {
-          transform-origin: 100px 100px;
-          animation: orb-spin 30s linear infinite;
-        }
-        .jarvis-orb .orb-arc {
-          transform-origin: 100px 100px;
-          animation: orb-spin-reverse 12s linear infinite;
-        }
-        .jarvis-orb .orb-core {
-          transform-origin: center;
-          animation: orb-core-breathe 4s ease-in-out infinite;
-        }
-
+        .jarvis-orb .orb-outer { transform-origin: 100px 100px; animation: orb-spin 30s linear infinite; }
+        .jarvis-orb .orb-arc { transform-origin: 100px 100px; animation: orb-spin-reverse 12s linear infinite; }
+        .jarvis-orb .orb-core { transform-origin: center; animation: orb-core-breathe 4s ease-in-out infinite; }
         .jarvis-orb.orb-speaking .orb-core { animation: orb-core-speak 0.7s ease-in-out infinite; }
         .jarvis-orb.orb-speaking .orb-outer { animation-duration: 8s; }
         .jarvis-orb.orb-speaking .orb-arc { animation-duration: 4s; }
-
         .jarvis-orb.orb-listening .orb-core { animation: orb-core-listen 1.2s ease-in-out infinite; }
         .jarvis-orb.orb-listening .orb-outer { animation-duration: 15s; }
-
         .jarvis-orb.orb-processing .orb-arc { animation-duration: 1.5s; }
 
-        /* Position absolue de l'orb : centré horizontalement, fixe verticalement sous le header */
         .orb-stage {
           position: relative;
           display: flex;
@@ -586,6 +636,17 @@ export default function JarvisInterface({ auth, onLogout }) {
       <div className="absolute inset-0 pointer-events-none"
            style={{ background: 'radial-gradient(circle at 50% 30%, rgba(91,158,255,0.08), transparent 60%)' }} />
       <div className="absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-[#5b9eff]/30 to-transparent scan-line pointer-events-none" />
+
+      {/* Notification banner - apparaît quand minuteur/alarme se déclenche */}
+      {notification && (
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-full bg-[#5b9eff] text-[#06060a] font-mono text-sm font-medium msg-in shadow-2xl">
+          <Bell size={16} />
+          <span>{notification}</span>
+          <button onClick={() => setNotification(null)} className="ml-2 hover:opacity-70">
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {/* Header */}
       <header className="relative z-10 flex items-center justify-between px-8 py-6 border-b border-white/5">
@@ -613,7 +674,6 @@ export default function JarvisInterface({ auth, onLogout }) {
 
       {/* Zone principale */}
       <main className="relative z-10 flex flex-col items-center px-6 pb-48 pt-2 max-w-5xl mx-auto min-h-[calc(100vh-200px)]">
-        {/* Orb XL toujours visible - taille responsive selon viewport */}
         <div className="orb-stage">
           <JarvisOrb state={orbState} size={orbSize} />
           {isEmpty && (
@@ -626,7 +686,6 @@ export default function JarvisInterface({ auth, onLogout }) {
           )}
         </div>
 
-        {/* Affichage des 2 dernières discussions (4 messages max) */}
         <div className="w-full max-w-3xl mx-auto space-y-4 mt-6">
           {visibleMessages.map((m, i) => (
             <div key={`${m.ts}-${i}`} className={`flex msg-in ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -661,11 +720,33 @@ export default function JarvisInterface({ auth, onLogout }) {
         <div ref={messagesEndRef} />
       </main>
 
+      {/* Pills flottantes : minuteurs + alarmes actifs - bottom-left, au-dessus de la barre micro */}
+      {events.length > 0 && (
+        <div className="fixed bottom-44 left-6 z-30 space-y-2 max-w-[280px]">
+          {events.map(e => (
+            <div key={e.id}
+                 className="flex items-center gap-2 px-3 py-2 rounded-full bg-white/5 border border-white/10 backdrop-blur-sm font-mono text-xs text-[#e8e8ec]">
+              {e.type === 'timer'
+                ? <Clock size={12} className="text-[#5b9eff] flex-shrink-0" />
+                : <Bell size={12} className="text-[#5b9eff] flex-shrink-0" />}
+              <span className="text-[#5b9eff] tabular-nums">
+                {e.type === 'timer' ? formatRemaining(e.firesAt - now) : formatAlarmTime(e.firesAt)}
+              </span>
+              {e.label && <span className="truncate text-[#6b6b78]">· {e.label}</span>}
+              <button onClick={() => cancelEvent(e.id)}
+                      className="ml-auto text-[#6b6b78] hover:text-red-300 flex-shrink-0"
+                      aria-label="Annuler">
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Barre micro fixe */}
       <div className="fixed bottom-0 inset-x-0 z-20 pb-10 pt-8 pointer-events-none"
            style={{ background: 'linear-gradient(to top, #06060a 60%, transparent)' }}>
         <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-6 pointer-events-auto">
-          {/* Indicateur d'enregistrement - Whisper ne stream pas, on affiche juste un signal visuel */}
           {isListening && (
             <div className="font-mono text-sm text-[#5b9eff] text-center">
               Enregistrement

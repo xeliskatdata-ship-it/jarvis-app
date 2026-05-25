@@ -1,5 +1,6 @@
 // Backend Jarvis - API REST avec auth JWT
 // v6 : tutoiement + prononciation correcte des prénoms à épeler
+// v7 : ajout minuteur, alarme, blagues
 
 import express from 'express'
 import cors from 'cors'
@@ -30,7 +31,6 @@ const upload = multer({
 })
 
 // Prononciation forcée des prénoms - permet au TTS de bien épeler
-// 
 const NAME_PRONUNCIATION = {
   'Kat': 'Kate'
 }
@@ -63,7 +63,69 @@ const WEB_SEARCH_TOOL = {
   }
 }
 
-// ===== PERSONA v6 - tutoiement, plus naturel =====
+// Outil minuteur - le déclenchement se fait côté client
+const SET_TIMER_TOOL = {
+  type: 'function',
+  function: {
+    name: 'set_timer',
+    description: `Démarre un minuteur (compte à rebours côté navigateur, sonne automatiquement à la fin).
+À utiliser UNIQUEMENT quand l'utilisateur demande un minuteur ou un rappel dans un délai relatif.
+Exemples :
+- "mets-moi un minuteur de 5 minutes" -> duration_seconds=300
+- "préviens-moi dans une heure et demie pour le four" -> duration_seconds=5400, label="four"
+- "compte à rebours de 30 secondes" -> duration_seconds=30
+- "rappelle-moi dans 2h" -> duration_seconds=7200`,
+    parameters: {
+      type: 'object',
+      properties: {
+        duration_seconds: {
+          type: 'integer',
+          description: 'Durée totale en secondes'
+        },
+        label: {
+          type: 'string',
+          description: 'Description courte du minuteur (ex: "pâtes", "pause"). Vide si non précisé.'
+        }
+      },
+      required: ['duration_seconds']
+    }
+  }
+}
+
+// Outil alarme - le déclenchement se fait à l'heure dite, côté client
+const SET_ALARM_TOOL = {
+  type: 'function',
+  function: {
+    name: 'set_alarm',
+    description: `Programme une alarme à une heure précise (sonne automatiquement à l'heure dite côté navigateur).
+À utiliser pour des heures absolues, pas des durées relatives.
+Si l'heure est déjà passée aujourd'hui, l'alarme se déclenche le lendemain.
+Exemples :
+- "réveille-moi à 7h" -> hour=7, minute=0, label="réveil"
+- "alarme à 14h30 pour le rendez-vous" -> hour=14, minute=30, label="rendez-vous"
+- "préviens-moi à 18h15" -> hour=18, minute=15`,
+    parameters: {
+      type: 'object',
+      properties: {
+        hour: {
+          type: 'integer',
+          description: 'Heure (0-23, format 24h)'
+        },
+        minute: {
+          type: 'integer',
+          description: 'Minute (0-59), 0 par défaut si non précisé'
+        },
+        label: {
+          type: 'string',
+          description: 'Description courte de l\'alarme (ex: "réveil", "rendez-vous"). Vide si non précisé.'
+        }
+      },
+      required: ['hour']
+    }
+  }
+}
+
+// ===== PERSONA v7 - tutoiement, capacités utilitaires =====
 const JARVIS_PERSONA = `Tu es Jarvis, l'intelligence artificielle personnelle de l'utilisateur, inspirée de l'IA d'Iron Man.
 Sophistiqué, calme, légèrement britannique d'esprit, avec un sens de l'humour bien à toi.
 
@@ -90,6 +152,13 @@ ACCÈS WEB - tu disposes d'un outil 'web_search' :
 - Utilise-le pour les informations récentes ou changeantes (actualité, météo, prix, scores, faits récents).
 - Ne l'utilise JAMAIS pour ce que tu sais déjà (connaissances générales, conversation, code).
 - Intègre l'info naturellement dans ta réponse, sans dire "j'ai cherché sur le web" sauf si pertinent.
+
+CAPACITÉS UTILITAIRES :
+- Minuteur (compte à rebours) : tu peux en lancer via l'outil 'set_timer' quand on te le demande explicitement ("mets un minuteur de X minutes", "préviens-moi dans Y heures", "compte à rebours de Z secondes"). Le déclenchement (sonnerie) se fait automatiquement côté navigateur, tu n'as plus à t'en soucier après.
+- Alarme (heure précise) : via l'outil 'set_alarm' pour les heures absolues ("réveille-moi à 7h", "alarme à 14h30"). Idem, déclenchement automatique côté client.
+- Blagues : si on te demande une blague, vas-y dans ton style pince-sans-rire britannique. Privilégie l'absurde, le jeu de mots, l'observation décalée, l'humour anglais. Pas de blagues plates Carambar ou potaches.
+
+Après avoir lancé un minuteur ou une alarme, confirme brièvement avec ton ton habituel : "Réglé. 5 minutes." / "Très bien. Sept heures précises." / "C'est noté."
 
 USAGE DES MÉMOIRES - RÈGLE CRUCIALE :
 - Tes mémoires sont là pour répondre PRÉCISÉMENT à ce qui est demandé, pas pour étaler ce que tu sais.
@@ -125,7 +194,6 @@ function applyNamePronunciation(text) {
   if (!text) return text
   let result = text
   for (const [original, phonetic] of Object.entries(NAME_PRONUNCIATION)) {
-    // Remplacement word-boundary pour éviter de toucher d'autres mots
     const regex = new RegExp(`\\b${original}\\b`, 'g')
     result = result.replace(regex, phonetic)
   }
@@ -209,7 +277,6 @@ app.post('/chat', authRequired, async (req, res) => {
     const partnerName = await getPartnerName(userId)
     const partnerInfo = partnerName ? `Son/sa partenaire de vie s'appelle ${partnerName}.` : ''
 
-    // Note de prononciation injectée dans le prompt si applicable
     const pronunciationHint = NAME_PRONUNCIATION[userName]
       ? `\n\nIMPORTANT - prononciation : Le prénom "${userName}" doit être prononcé "${NAME_PRONUNCIATION[userName]}" (lettre par lettre) car le TTS le prononce mal sinon. Mais tu peux l'écrire normalement, le système remplace automatiquement.`
       : ''
@@ -228,11 +295,23 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       { role: 'user', content: transcript }
     ]
 
-    const tools = [WEB_SEARCH_TOOL]
+    // 3 outils disponibles : web_search, set_timer, set_alarm
+    const tools = [WEB_SEARCH_TOOL, SET_TIMER_TOOL, SET_ALARM_TOOL]
     const toolExecutors = {
       web_search: async ({ query: q }) => {
         const result = await tavilySearch(q, { depth: 'basic', maxResults: 4 })
         return formatSearchForLLM(result)
+      },
+      // Le set_timer côté backend ne fait que confirmer au LLM - le vrai minuteur tourne côté navigateur
+      set_timer: ({ duration_seconds, label }) => {
+        const min = Math.floor(duration_seconds / 60)
+        const sec = duration_seconds % 60
+        const durStr = min ? `${min} minute(s)${sec ? ` ${sec} seconde(s)` : ''}` : `${sec} seconde(s)`
+        return `Minuteur démarré côté client pour ${durStr}${label ? ` (${label})` : ''}. Confirme brièvement et naturellement.`
+      },
+      set_alarm: ({ hour, minute, label }) => {
+        const m = (minute || 0).toString().padStart(2, '0')
+        return `Alarme programmée côté client à ${hour}h${m}${label ? ` (${label})` : ''}. Confirme brièvement et naturellement.`
       }
     }
 
@@ -240,16 +319,14 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       messages, tools, toolExecutors, { temperature: 0.8 }
     )
 
-    // Post-traitement : forcer la prononciation correcte des prénoms
     const reply = applyNamePronunciation(rawReply)
 
     if (toolsCalled.length > 0) {
       console.log(`[chat] ${toolsCalled.length} appel(s) outil(s) :`,
-        toolsCalled.map(t => `${t.name}(${t.args.query || ''})`).join(', '))
+        toolsCalled.map(t => `${t.name}(${JSON.stringify(t.args).slice(0, 60)})`).join(', '))
     }
 
     await withTransaction(async (client) => {
-      // On stocke la version "naturelle" (avec Kat, pas K A T) en DB pour relecture humaine
       await client.query(
         `INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2), ($1, 'assistant', $3)`,
         [conversationId, transcript, rawReply]
@@ -266,8 +343,23 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
 
     extractFacts(userId, transcript, rawReply).catch(e => console.warn('extract bg:', e.message))
 
-    // Envoie la version corrigée prononciation au front (pour TTS)
-    res.json({ reply, searched: toolsCalled.length > 0 })
+    // Extrait les appels timer/alarm pour que le frontend puisse créer les vrais déclencheurs
+    const timerCall = toolsCalled.find(t => t.name === 'set_timer')
+    const alarmCall = toolsCalled.find(t => t.name === 'set_alarm')
+
+    res.json({
+      reply,
+      searched: toolsCalled.some(t => t.name === 'web_search'),
+      timer: timerCall ? {
+        duration_seconds: timerCall.args.duration_seconds,
+        label: timerCall.args.label || null
+      } : null,
+      alarm: alarmCall ? {
+        hour: alarmCall.args.hour,
+        minute: alarmCall.args.minute || 0,
+        label: alarmCall.args.label || null
+      } : null
+    })
   } catch (err) {
     console.error('[/chat]', err)
     res.status(500).json({ error: 'Erreur serveur', detail: err.message })
@@ -334,6 +426,6 @@ app.listen(PORT, () => {
   console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
-  console.log(`Persona   : Jarvis Stark v6 (tutoiement + prononciation)`)
+  console.log(`Persona   : Jarvis Stark v7 (tutoiement + prononciation + minuteur/alarme/blagues)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
