@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell } from 'lucide-react'
+import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
@@ -89,7 +89,6 @@ function formatRemaining(ms) {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-// Formate un timestamp en heure de la journée (HHhmm)
 function formatAlarmTime(ts) {
   const d = new Date(ts)
   return `${d.getHours().toString().padStart(2, '0')}h${d.getMinutes().toString().padStart(2, '0')}`
@@ -109,15 +108,15 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [elevenlabsKey, setElevenlabsKey] = useState('')
   const [elevenlabsVoiceId, setElevenlabsVoiceId] = useState(DEFAULT_VOICE_ID)
 
-  // Minuteurs + alarmes actifs - chaque event = { id, type, firesAt, label }
   const [events, setEvents] = useState([])
-  const [notification, setNotification] = useState(null)  // string ou null
-  const [now, setNow] = useState(Date.now())  // refresh pour les countdowns
+  const [notification, setNotification] = useState(null)
+  const [now, setNow] = useState(Date.now())
 
   const messagesEndRef = useRef(null)
   const audioRef = useRef(null)
   const audioCtxRef = useRef(null)
   const audioSourceRef = useRef(null)
+  const beepIntervalRef = useRef(null)  // boucle de bips pour minuteur/alarme - tourne tant que notification active
 
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
@@ -164,18 +163,18 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [auth.user.id])
 
-  // Sauvegarde events à chaque changement
   useEffect(() => {
     localStorage.setItem(eventsKey(auth.user.id), JSON.stringify(events))
   }, [events, auth.user.id])
 
-  // Cleanup à l'unmount : libère le micro si toujours actif
+  // Cleanup à l'unmount : libère le micro + arrête la boucle de bips si en cours
   useEffect(() => {
     return () => {
       if (mediaRecorderRef.current?.state === 'recording') {
         mediaRecorderRef.current.stop()
       }
       mediaStreamRef.current?.getTracks().forEach(t => t.stop())
+      if (beepIntervalRef.current) clearInterval(beepIntervalRef.current)
     }
   }, [])
 
@@ -215,7 +214,7 @@ export default function JarvisInterface({ auth, onLogout }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isProcessing])
 
-  // Joue 3 beeps via Web Audio API - sonnerie de minuteur/alarme
+  // Joue 3 beeps via Web Audio API - briquette de base de la sonnerie
   const playBeep = () => {
     const ctx = audioCtxRef.current
     if (!ctx) return
@@ -229,26 +228,39 @@ export default function JarvisInterface({ auth, onLogout }) {
       osc.frequency.value = 880
       osc.type = 'sine'
       gain.gain.setValueAtTime(0, t)
-      gain.gain.linearRampToValueAtTime(0.3, t + 0.02)  // attack rapide
-      gain.gain.linearRampToValueAtTime(0, t + 0.3)    // release
+      gain.gain.linearRampToValueAtTime(0.3, t + 0.02)
+      gain.gain.linearRampToValueAtTime(0, t + 0.3)
       osc.connect(gain).connect(ctx.destination)
       osc.start(t)
       osc.stop(t + 0.3)
     }
   }
 
-  // Déclenche notification visuelle + sonore
+  // Démarre la boucle de bips (toutes les 2.2s) - tourne jusqu'à dismissNotification
+  const startBeepLoop = () => {
+    if (beepIntervalRef.current) clearInterval(beepIntervalRef.current)  // safety : pas de double-loop
+    playBeep()  // 1er bip immédiat
+    beepIntervalRef.current = setInterval(playBeep, 2200)
+  }
+
+  const stopBeepLoop = () => {
+    if (beepIntervalRef.current) {
+      clearInterval(beepIntervalRef.current)
+      beepIntervalRef.current = null
+    }
+  }
+
+  // Déclenche notification (sonnerie répétitive + banner) - reste actif jusqu'à dismiss explicite
   const fireNotification = (message) => {
-    playBeep()
+    startBeepLoop()
     setNotification(message)
   }
 
-  // Auto-dismiss notification après 10s
-  useEffect(() => {
-    if (!notification) return
-    const id = setTimeout(() => setNotification(null), 10000)
-    return () => clearTimeout(id)
-  }, [notification])
+  // Arrête tout d'un coup : la boucle de bips + le banner
+  const dismissNotification = () => {
+    stopBeepLoop()
+    setNotification(null)
+  }
 
   // Tick toutes les secondes : met à jour `now` + déclenche les events échus
   useEffect(() => {
@@ -269,14 +281,12 @@ export default function JarvisInterface({ auth, onLogout }) {
     return () => clearInterval(intervalId)
   }, [])
 
-  // Ajoute un minuteur (durée en secondes)
   const addTimer = (durationSeconds, label) => {
     const id = `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const firesAt = Date.now() + durationSeconds * 1000
     setEvents(prev => [...prev, { id, type: 'timer', firesAt, label: label || null }])
   }
 
-  // Ajoute une alarme (heure dans la journée, demain si déjà passée)
   const addAlarm = (hour, minute, label) => {
     const target = new Date()
     target.setHours(hour, minute || 0, 0, 0)
@@ -285,7 +295,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     setEvents(prev => [...prev, { id, type: 'alarm', firesAt: target.getTime(), label: label || null }])
   }
 
-  // Annule un event (clic sur la croix)
   const cancelEvent = (id) => {
     setEvents(prev => prev.filter(e => e.id !== id))
   }
@@ -378,7 +387,6 @@ export default function JarvisInterface({ auth, onLogout }) {
       if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
       const blob = await res.blob()
 
-      // Web Audio API uniquement sur iOS, HTML5 Audio sur les autres
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
       if (isIOS) {
@@ -413,7 +421,6 @@ export default function JarvisInterface({ auth, onLogout }) {
       const reply = data.reply || "Pas de réponse reçue."
       setMessages(prev => [...prev, { role: 'jarvis', content: reply, ts: Date.now() }])
 
-      // Si la LLM a déclenché set_timer ou set_alarm, on crée le vrai event côté client
       if (data.timer) addTimer(data.timer.duration_seconds, data.timer.label)
       if (data.alarm) addAlarm(data.alarm.hour, data.alarm.minute, data.alarm.label)
 
@@ -589,6 +596,9 @@ export default function JarvisInterface({ auth, onLogout }) {
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         .cursor-blink { animation: blink 1s step-end infinite; }
 
+        @keyframes alarm-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+        .alarm-pulse { animation: alarm-pulse 1s ease-in-out infinite; }
+
         .glow-accent { box-shadow: 0 0 40px rgba(91,158,255,0.4), inset 0 0 20px rgba(91,158,255,0.1); }
         .glow-text { text-shadow: 0 0 20px rgba(91,158,255,0.5); }
 
@@ -631,24 +641,22 @@ export default function JarvisInterface({ auth, onLogout }) {
         }
       `}</style>
 
-      {/* Background atmosphérique */}
       <div className="absolute inset-0 bg-grid opacity-60 pointer-events-none" />
       <div className="absolute inset-0 pointer-events-none"
            style={{ background: 'radial-gradient(circle at 50% 30%, rgba(91,158,255,0.08), transparent 60%)' }} />
       <div className="absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-[#5b9eff]/30 to-transparent scan-line pointer-events-none" />
 
-      {/* Notification banner - apparaît quand minuteur/alarme se déclenche */}
+      {/* Notification banner - apparaît quand minuteur/alarme se déclenche, reste jusqu'au dismiss */}
       {notification && (
-        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-full bg-[#5b9eff] text-[#06060a] font-mono text-sm font-medium msg-in shadow-2xl">
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-full bg-[#5b9eff] text-[#06060a] font-mono text-sm font-medium msg-in shadow-2xl alarm-pulse">
           <Bell size={16} />
           <span>{notification}</span>
-          <button onClick={() => setNotification(null)} className="ml-2 hover:opacity-70">
+          <button onClick={dismissNotification} className="ml-2 hover:opacity-70">
             <X size={14} />
           </button>
         </div>
       )}
 
-      {/* Header */}
       <header className="relative z-10 flex items-center justify-between px-8 py-6 border-b border-white/5">
         <div className="flex items-center gap-3">
           <div className="w-6 h-6">
@@ -672,7 +680,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         </button>
       </header>
 
-      {/* Zone principale */}
       <main className="relative z-10 flex flex-col items-center px-6 pb-48 pt-2 max-w-5xl mx-auto min-h-[calc(100vh-200px)]">
         <div className="orb-stage">
           <JarvisOrb state={orbState} size={orbSize} />
@@ -720,7 +727,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         <div ref={messagesEndRef} />
       </main>
 
-      {/* Pills flottantes : minuteurs + alarmes actifs - bottom-left, au-dessus de la barre micro */}
+      {/* Pills flottantes : minuteurs + alarmes actifs */}
       {events.length > 0 && (
         <div className="fixed bottom-44 left-6 z-30 space-y-2 max-w-[280px]">
           {events.map(e => (
@@ -746,7 +753,7 @@ export default function JarvisInterface({ auth, onLogout }) {
       {/* Barre micro fixe */}
       <div className="fixed bottom-0 inset-x-0 z-20 pb-10 pt-8 pointer-events-none"
            style={{ background: 'linear-gradient(to top, #06060a 60%, transparent)' }}>
-        <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-6 pointer-events-auto">
+        <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-4 pointer-events-auto">
           {isListening && (
             <div className="font-mono text-sm text-[#5b9eff] text-center">
               Enregistrement
@@ -781,6 +788,17 @@ export default function JarvisInterface({ auth, onLogout }) {
               <Mic size={28} strokeWidth={1.5} className={isListening ? 'text-[#06060a]' : 'text-[#e8e8ec]'} />
             </button>
           </div>
+
+          {/* Bouton "Arrêter la sonnerie" - visible UNIQUEMENT quand une alarme/minuteur sonne */}
+          {notification && (
+            <button
+              onClick={dismissNotification}
+              className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-500/20 border border-red-500/40 hover:bg-red-500/30 text-red-300 font-mono text-xs uppercase tracking-[0.2em] msg-in alarm-pulse"
+            >
+              <BellOff size={14} />
+              Arrêter la sonnerie
+            </button>
+          )}
 
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-[#6b6b78]">
             {isListening ? 'cliquez pour arrêter' :
