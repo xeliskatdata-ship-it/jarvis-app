@@ -1,6 +1,7 @@
 // Backend Jarvis - API REST avec auth JWT
 // v6 : tutoiement + prononciation correcte des prénoms à épeler
 // v7 : ajout minuteur, alarme, blagues
+// v8 : N1 - mémoire explicite ("souviens-toi que...")
 
 import express from 'express'
 import cors from 'cors'
@@ -11,7 +12,7 @@ import multer from 'multer'
 
 import { query, withTransaction } from './db.js'
 import { chat, chatWithTools } from './groq.js'
-import { getMemoriesContext, extractFacts } from './memory.js'
+import { getMemoriesContext, extractFacts, detectExplicitTrigger, extractExplicitFact } from './memory.js'
 import { tavilySearch, formatSearchForLLM } from './tavily.js'
 import { transcribe } from './whisper.js'
 
@@ -180,6 +181,7 @@ USAGE DES MÉMOIRES - RÈGLE CRUCIALE :
 - Pour les questions générales (heure, météo, calculs, faits du monde), réponds simplement sans détourner vers les projets, le partenaire ou les détails personnels.
 - Tu n'invoques un détail mémorisé QUE si la question s'y rapporte DIRECTEMENT.
 - Ne fais JAMAIS de suggestion non sollicitée du genre "tu pourrais discuter de X avec Y".
+- Quand l'utilisateur te dit "souviens-toi que..." ou équivalent, confirme simplement et brièvement ("C'est noté.", "Très bien.", "Mémorisé."). La mémorisation est gérée en arrière-plan, tu n'as pas à faire de promesse de rappel.
 
 FORMAT DE RÉPONSE :
 - Tes réponses sont lues à haute voix : zéro markdown, zéro liste à puces, zéro bloc de code.
@@ -356,13 +358,19 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
 
       for (const tc of toolsCalled.filter(t => t.name === 'web_search')) {
         await client.query(`
-          INSERT INTO memories (user_id, fact, category, importance, shared)
-          VALUES ($1, $2, 'web_research', 5, false)
+          INSERT INTO memories (user_id, fact, category, importance, shared, source)
+          VALUES ($1, $2, 'web_research', 5, false, 'auto')
         `, [userId, `A recherché "${tc.args.query}" le ${new Date().toLocaleDateString('fr-FR')}`])
       }
     })
 
     extractFacts(userId, transcript, rawReply).catch(e => console.warn('extract bg:', e.message))
+
+    // N1 : si l'utilisateur a dit "souviens-toi que...", on extrait en parallele
+    // La nouvelle memoire sera disponible des le prochain tour de conversation
+    if (detectExplicitTrigger(transcript)) {
+      extractExplicitFact(userId, transcript).catch(e => console.warn('explicit bg:', e.message))
+    }
 
     // Extrait les appels timer/alarm pour que le frontend puisse créer les vrais déclencheurs
     // parseInt nécessaire : on stocke en string côté Groq mais le frontend attend des int
@@ -425,7 +433,7 @@ app.get('/history', authRequired, async (req, res) => {
 app.get('/memories', authRequired, async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT m.id, m.fact, m.category, m.importance, m.shared, m.created_at,
+      SELECT m.id, m.fact, m.category, m.importance, m.shared, m.source, m.created_at,
              u.name as owner_name
       FROM memories m
       JOIN users u ON u.id = m.user_id
@@ -448,6 +456,6 @@ app.listen(PORT, () => {
   console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
-  console.log(`Persona   : Jarvis Stark v7 (tutoiement + prononciation + minuteur/alarme/blagues)`)
+  console.log(`Persona   : Jarvis Stark v8 (N1 mémoire explicite activée)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
