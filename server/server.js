@@ -2,10 +2,10 @@
 // v8  : N1 - mémoire explicite
 // v9  : N2 - recherche vectorielle top-K
 // v10 : S1 - hardening API (Helmet, rate-limit, CORS strict, Zod)
-// v11 : S2 - sanitization tavily + fix rate-limit double-proxy (cf-connecting-ip)
+// v11 : S2 - sanitization tavily + fix rate-limit double-proxy
 // v12 : RSS context enricher - endpoint /rss/refresh + cron GitHub Actions
-// v13 : S3 - audit & quotas (logs structurés, quota tokens/user, endpoint /admin/usage)
-//       Switch modèle vers GPT-OSS 120B + fix ERR_ERL_KEY_GEN_IPV6 (ipKeyGenerator)
+// v13 : S3 - audit & quotas (usage_logs, /admin/usage, fix IPv6)
+// v14 : N4 - auto-reflexion (trigger background dans /chat + endpoints /reflect/*)
 
 import express from 'express'
 import cors from 'cors'
@@ -24,31 +24,26 @@ import { tavilySearch, formatSearchForLLM } from './tavily.js'
 import { transcribe } from './whisper.js'
 import { refreshAllFeeds } from './rss.js'
 import { logUsage, checkQuota, getAdminStats, DAILY_QUOTA_TOKENS } from './usage.js'
+import { maybeReflect, reflectOnConversation, findDormantConversation } from './reflect.js'
 
 dotenv.config({ path: '../.env' })
 
 const app = express()
 const PORT = process.env.PORT || 3001
 
-// Render derriere LB + Cloudflare devant
 app.set('trust proxy', 1)
 
 // Resolveur d'IP robuste : Cloudflare ajoute cf-connecting-ip avec la vraie IP
-// ipKeyGenerator normalise les IPv6 (mask /64) pour eviter le bypass par changement de bits
-// Fix l'avertissement ERR_ERL_KEY_GEN_IPV6 d'express-rate-limit
 const ipKey = (req) => {
   const rawIp = req.headers['cf-connecting-ip'] || req.ip
   return ipKeyGenerator(rawIp)
 }
 
-// Set des user_id ayant acces aux endpoints admin (Kat=1, Brice=2)
-// Pour ajouter un user admin plus tard : juste un push ici, pas besoin de migration DB
+// Admin user_ids (Kat=1, Brice=2)
 const ADMIN_USER_IDS = new Set([1, 2])
 
-// === Helmet : headers HTTP de securite ===
 app.use(helmet())
 
-// === CORS strict : whitelist explicite ===
 const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173').split(',')
 app.use(cors({
   origin: allowedOrigins,
@@ -269,6 +264,7 @@ USAGE DES MÉMOIRES - RÈGLE CRUCIALE :
 - Ne fais JAMAIS de suggestion non sollicitée du genre "tu pourrais discuter de X avec Y".
 - Quand l'utilisateur te dit "souviens-toi que..." ou équivalent, confirme simplement et brièvement ("C'est noté.", "Très bien.", "Mémorisé."). La mémorisation est gérée en arrière-plan, tu n'as pas à faire de promesse de rappel.
 - Certaines mémoires sont de catégorie 'news' (issues d'un flux RSS automatique) : utilise-les si l'utilisateur demande l'actualité récente, mais ne les mentionne pas spontanément si ce n'est pas pertinent.
+- Certaines mémoires sont de catégorie 'pattern' (issues d'auto-réflexion de Jarvis sur des conversations passées) : ce sont des observations comportementales sur l'utilisateur. Tu peux t'en servir pour adapter ton ton et tes réponses, mais ne les cite jamais explicitement (l'utilisateur ne doit pas se sentir "analysé").
 
 FORMAT DE RÉPONSE :
 - Tes réponses sont lues à haute voix : zéro markdown, zéro liste à puces, zéro bloc de code.
@@ -316,8 +312,6 @@ function authRequired(req, res, next) {
   }
 }
 
-// Admin requis : Kat et Brice uniquement (set ADMIN_USER_IDS)
-// A utiliser APRES authRequired pour que req.user soit dispo
 function adminRequired(req, res, next) {
   if (!req.user?.id || !ADMIN_USER_IDS.has(req.user.id)) {
     return res.status(403).json({ error: 'Acces admin requis' })
@@ -370,7 +364,7 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
   const userId = req.user.id
   const userName = req.user.name
 
-  // === S3 : check quota tokens AVANT l'appel LLM ===
+  // Check quota tokens AVANT l'appel LLM
   const quota = await checkQuota(userId)
   if (quota.exceeded) {
     console.warn(`[/chat] quota tokens depasse pour user ${userId}: ${quota.used}/${quota.limit}`)
@@ -381,6 +375,11 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
       limit: quota.limit
     })
   }
+
+  // === N4 : trigger reflexion sur conv dormante (en background, ne bloque PAS la reponse) ===
+  // Si l'user revient apres >30min avec une conv >=5 echanges non reflechie, on reflechit dessus
+  // pendant qu'on traite sa nouvelle demande. Resultat injecte dans la prochaine /chat via N2.
+  maybeReflect(userId).catch(e => console.warn('reflect bg:', e.message))
 
   try {
     const { transcript } = req.body
@@ -440,12 +439,10 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       }
     }
 
-    // === S3 : recupere usage + model du retour ===
     const { content: rawReply, toolsCalled, usage, model } = await chatWithTools(
       messages, tools, toolExecutors, { temperature: 0.8 }
     )
 
-    // Log usage chat principal (apres succes)
     logUsage({ userId, endpoint: 'chat', model, usage, statusCode: 200 })
 
     const reply = applyNamePronunciation(rawReply)
@@ -491,7 +488,6 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
         minute: parseInt(alarmCall.args.minute, 10) || 0,
         label: alarmCall.args.label || null
       } : null,
-      // Bonus : on remonte au front le quota restant (utile pour afficher une jauge)
       quota_remaining: Math.max(0, quota.remaining - (usage?.total_tokens || 0))
     })
   } catch (err) {
@@ -516,8 +512,6 @@ app.post('/transcribe', authRequired, userLimiter, upload.single('audio'), async
     const elapsed = Date.now() - t0
     console.log(`[transcribe] ${req.file.size}B -> "${text.slice(0, 60)}" (${elapsed}ms)`)
 
-    // Whisper ne remonte pas d'usage tokens - on logue juste l'appel
-    // total_tokens=0 mais on garde la trace (latence visible via timestamp)
     logUsage({ userId, endpoint: 'transcribe', model: 'whisper-large-v3-turbo', statusCode: 200 })
 
     res.json({ text })
@@ -542,8 +536,6 @@ app.post('/rss/refresh', async (req, res) => {
 
   try {
     const result = await refreshAllFeeds(1)
-    // Log usage : refresh consomme Mistral pas Groq, donc tokens=0 (Mistral free tier non compte ici)
-    // On garde quand meme la trace de l'appel cron pour audit
     logUsage({ userId: null, endpoint: 'rss_refresh', statusCode: 200 })
     res.json(result)
   } catch (err) {
@@ -585,8 +577,8 @@ app.get('/memories', authRequired, async (req, res) => {
   }
 })
 
-// === S3 : Endpoint admin pour voir la conso et les erreurs ===
-// Reserve aux users dans ADMIN_USER_IDS (Kat=1, Brice=2)
+// ====== ROUTES ADMIN ======
+
 app.get('/admin/usage', authRequired, adminRequired, async (req, res) => {
   try {
     const stats = await getAdminStats()
@@ -597,13 +589,59 @@ app.get('/admin/usage', authRequired, adminRequired, async (req, res) => {
   }
 })
 
-// Endpoint pour qu'un user voit son propre quota (pour afficher une jauge front)
 app.get('/usage/me', authRequired, async (req, res) => {
   try {
     const quota = await checkQuota(req.user.id)
     res.json(quota)
   } catch (err) {
     res.status(500).json({ error: 'Erreur serveur' })
+  }
+})
+
+// ====== ROUTES N4 AUTO-REFLEXION ======
+
+// Liste les patterns (lecons) sur le user authentifie
+// Ordre antichrono : les plus recentes d'abord
+app.get('/reflections', authRequired, async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT id, fact AS lesson, category, importance, created_at
+      FROM memories
+      WHERE user_id = $1 AND source = 'reflection'
+      ORDER BY created_at DESC
+    `, [req.user.id])
+    res.json({ count: rows.length, reflections: rows })
+  } catch (err) {
+    console.error('[/reflections]', err)
+    res.status(500).json({ error: 'Erreur serveur' })
+  }
+})
+
+// Force une reflexion immediate sur la conv dormante du user (si elle existe)
+// Reserve admin pour eviter qu'un user genere des reflexions a volonte (consomme des tokens)
+app.post('/reflect/now', authRequired, adminRequired, async (req, res) => {
+  const userId = req.user.id
+  try {
+    const dormant = await findDormantConversation(userId)
+    if (!dormant) {
+      return res.json({ 
+        ok: true, 
+        message: 'Aucune conv dormante a reflechir (besoin de >=5 echanges et >30min d\'inactivite).',
+        skipped: true
+      })
+    }
+
+    const result = await reflectOnConversation(userId, dormant.conversationId)
+    res.json({
+      ok: true,
+      conversation_id: dormant.conversationId,
+      message_count: dormant.messageCount,
+      minutes_ago: dormant.minutesAgo,
+      ...result
+    })
+  } catch (err) {
+    console.error('[/reflect/now]', err)
+    res.status(500).json({ error: 'Erreur reflexion', detail: err.message })
   }
 })
 
@@ -623,6 +661,7 @@ app.listen(PORT, () => {
   console.log(`Security  : Helmet + rate-limit (200/15min global, 30/15min user, 10/15min login)`)
   console.log(`Quota     : ${DAILY_QUOTA_TOKENS.toLocaleString()} tokens/user/jour`)
   console.log(`Admin IDs : [${Array.from(ADMIN_USER_IDS).join(', ')}]`)
-  console.log(`Persona   : Jarvis Stark v13 (N1 + N2 + S1 + S2 + RSS + S3 audit)`)
+  console.log(`Reflexion : N4 active (trigger background sur /chat + endpoint /reflect/now)`)
+  console.log(`Persona   : Jarvis Stark v14 (N1 + N2 + N4 + S1 + S2 + S3 + RSS)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
