@@ -25,3 +25,10 @@ dist-ssr
 
 #.env
 .env
+#test
+server/test.m4a
+
+*.m4a
+*.webm
+*.mp3
+test.*

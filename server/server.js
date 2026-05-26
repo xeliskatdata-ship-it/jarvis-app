@@ -2,6 +2,7 @@
 // v6 : tutoiement + prononciation correcte des prénoms à épeler
 // v7 : ajout minuteur, alarme, blagues
 // v8 : N1 - mémoire explicite ("souviens-toi que...")
+// v9 : N2 - recherche vectorielle top-K sur le message courant
 
 import express from 'express'
 import cors from 'cors'
@@ -65,7 +66,6 @@ const WEB_SEARCH_TOOL = {
 }
 
 // Outil minuteur - le déclenchement se fait côté client
-// duration_seconds en string : Llama 4 envoie souvent les nombres en string, on évite l'échec de validation Groq
 const SET_TIMER_TOOL = {
   type: 'function',
   function: {
@@ -95,7 +95,6 @@ Exemples :
 }
 
 // Outil alarme - le déclenchement se fait à l'heure dite, côté client
-// hour/minute en string : même raison que set_timer
 const SET_ALARM_TOOL = {
   type: 'function',
   function: {
@@ -128,8 +127,7 @@ Exemples :
   }
 }
 
-// ===== PERSONA v7 - tutoiement, capacités utilitaires =====
-// v7.1 : humour noir autorisé avec garde-fous (cible concepts, pas personnes)
+// ===== PERSONA v7.1 - tutoiement + humour noir avec garde-fous =====
 const JARVIS_PERSONA = `Tu es Jarvis, l'intelligence artificielle personnelle de l'utilisateur, inspirée de l'IA d'Iron Man.
 Sophistiqué, calme, légèrement britannique d'esprit, avec un sens de l'humour bien à toi.
 
@@ -170,9 +168,9 @@ ACCÈS WEB - tu disposes d'un outil 'web_search' :
 - Intègre l'info naturellement dans ta réponse, sans dire "j'ai cherché sur le web" sauf si pertinent.
 
 CAPACITÉS UTILITAIRES :
-- Minuteur (compte à rebours) : tu peux en lancer via l'outil 'set_timer' quand on te le demande explicitement ("mets un minuteur de X minutes", "préviens-moi dans Y heures", "compte à rebours de Z secondes"). Le déclenchement (sonnerie) se fait automatiquement côté navigateur, tu n'as plus à t'en soucier après.
-- Alarme (heure précise) : via l'outil 'set_alarm' pour les heures absolues ("réveille-moi à 7h", "alarme à 14h30"). Idem, déclenchement automatique côté client.
-- Blagues : si on te demande une blague, vas-y dans ton style pince-sans-rire britannique, humour noir bienvenu si demandé ou si le moment s'y prête. Privilégie l'absurde, le jeu de mots, l'observation décalée, le gallows humor élégant. Pas de blagues plates Carambar ou potaches. Pas de blagues longues à chute prévisible.
+- Minuteur (compte à rebours) : tu peux en lancer via l'outil 'set_timer' quand on te le demande explicitement.
+- Alarme (heure précise) : via l'outil 'set_alarm' pour les heures absolues.
+- Blagues : pince-sans-rire britannique, humour noir bienvenu si demandé.
 
 Après avoir lancé un minuteur ou une alarme, confirme brièvement avec ton ton habituel : "Réglé. 5 minutes." / "Très bien. Sept heures précises." / "C'est noté."
 
@@ -206,7 +204,6 @@ async function getPartnerName(userId) {
   return rows[0]?.name || null
 }
 
-// Applique la prononciation forcée pour les prénoms problématiques au TTS
 function applyNamePronunciation(text) {
   if (!text) return text
   let result = text
@@ -289,7 +286,8 @@ app.post('/chat', authRequired, async (req, res) => {
     `, [conversationId])
     const recentMessages = history.reverse().map(m => ({ role: m.role, content: m.content }))
 
-    const memoriesContext = await getMemoriesContext(userId)
+    // N2 : on passe le transcript pour activer la recherche vectorielle top-K
+    const memoriesContext = await getMemoriesContext(userId, transcript)
     const temporal = getTemporalContext()
     const partnerName = await getPartnerName(userId)
     const partnerInfo = partnerName ? `Son/sa partenaire de vie s'appelle ${partnerName}.` : ''
@@ -312,16 +310,13 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       { role: 'user', content: transcript }
     ]
 
-    // 3 outils disponibles : web_search, set_timer, set_alarm
     const tools = [WEB_SEARCH_TOOL, SET_TIMER_TOOL, SET_ALARM_TOOL]
     const toolExecutors = {
       web_search: async ({ query: q }) => {
         const result = await tavilySearch(q, { depth: 'basic', maxResults: 4 })
         return formatSearchForLLM(result)
       },
-      // set_timer côté backend : confirme juste au LLM - le vrai minuteur tourne côté navigateur
       set_timer: ({ duration_seconds, label }) => {
-        // Llama envoie souvent les nombres en string - on parse défensivement
         const sec = parseInt(duration_seconds, 10)
         if (isNaN(sec) || sec <= 0) return 'Erreur: durée invalide.'
         const m = Math.floor(sec / 60)
@@ -367,13 +362,10 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
     extractFacts(userId, transcript, rawReply).catch(e => console.warn('extract bg:', e.message))
 
     // N1 : si l'utilisateur a dit "souviens-toi que...", on extrait en parallele
-    // La nouvelle memoire sera disponible des le prochain tour de conversation
     if (detectExplicitTrigger(transcript)) {
       extractExplicitFact(userId, transcript).catch(e => console.warn('explicit bg:', e.message))
     }
 
-    // Extrait les appels timer/alarm pour que le frontend puisse créer les vrais déclencheurs
-    // parseInt nécessaire : on stocke en string côté Groq mais le frontend attend des int
     const timerCall = toolsCalled.find(t => t.name === 'set_timer')
     const alarmCall = toolsCalled.find(t => t.name === 'set_alarm')
 
@@ -397,7 +389,6 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
 })
 
 // ====== TRANSCRIBE ROUTE ======
-// Audio -> texte via Whisper Groq. Le front rappellera ensuite /chat avec le texte obtenu.
 app.post('/transcribe', authRequired, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Fichier audio manquant' })
@@ -453,9 +444,11 @@ app.listen(PORT, () => {
   console.log(`Port      : ${PORT}`)
   console.log(`LLM       : Groq`)
   console.log(`Whisper   : whisper-large-v3-turbo (via Groq)`)
+  console.log(`Embeddings: mistral-embed (via Mistral La Plateforme)`)
   console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
-  console.log(`Persona   : Jarvis Stark v8 (N1 mémoire explicite activée)`)
+  console.log(`Mistral   : ${process.env.MISTRAL_API_KEY ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
+  console.log(`Persona   : Jarvis Stark v9 (N1 + N2 vectoriel)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
