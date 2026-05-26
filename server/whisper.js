@@ -1,11 +1,27 @@
 // Service Whisper - transcription audio via Groq
 // Modèle turbo : 7x plus rapide que whisper-large-v3 standard, qualité quasi identique
 // Limite Groq : 25 Mo par fichier, formats webm/mp3/wav/m4a/ogg/flac/mp4
+// v2 : ajout d'un prompt de vocabulaire pour fixer les mots propres mal transcrits
+//      (Jarvis -> Chargis, etc.)
 
 const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
 const WHISPER_MODEL = 'whisper-large-v3-turbo'
 
-export async function transcribe(audioBuffer, { filename = 'audio.webm', language = 'fr' } = {}) {
+// Prompt = contexte donné à Whisper pour orienter ses prédictions
+// Format recommandé : phrase courte + noms propres + termes techniques recurrents
+// Limite : ~224 tokens (≈ 200 chars). Au-delà la qualité de transcription se degrade.
+// Ce prompt s'applique a CHAQUE transcription par defaut.
+const DEFAULT_VOCAB_PROMPT =
+  "Conversation entre Kat et Jarvis, son assistant IA personnel. " +
+  "Mentions possibles : Brice, Anthropic, StatCyberMatrix, WALL-E, " +
+  "Wild Code School, Raspberry Pi, Groq, Tavily, ElevenLabs, GitHub, " +
+  "ChromaDB, Arduino, Ollama."
+
+export async function transcribe(audioBuffer, {
+  filename = 'audio.webm',
+  language = 'fr',
+  prompt = DEFAULT_VOCAB_PROMPT  // override possible si besoin de contextes specifiques
+} = {}) {
   if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY manquante')
   if (!audioBuffer?.length) throw new Error('Audio vide')
 
@@ -15,6 +31,7 @@ export async function transcribe(audioBuffer, { filename = 'audio.webm', languag
   form.append('file', blob, filename)
   form.append('model', WHISPER_MODEL)
   form.append('language', language) // force le français, évite les mauvaises détections
+  if (prompt) form.append('prompt', prompt) // contexte de vocabulaire
 
   const res = await fetch(GROQ_TRANSCRIBE_URL, {
     method: 'POST',
