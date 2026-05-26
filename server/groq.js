@@ -7,22 +7,14 @@ dotenv.config({ path: '../.env' })
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
-// Modele principal : Llama 3.3 70B versatile
-// - Tool calling solide (#1 sur BFCL parmi les modeles open-source)
-// - Quota free tier separe de Llama 4 (= debloque la situation actuelle de Kat)
-// - 128k context
+// Modele principal : openai/gpt-oss-120b
+// 
 const MODEL = 'openai/gpt-oss-120b'
 
 // Modele leger pour taches structurees en background (extraction de faits)
 // ~9x moins de tokens consommes que le 70B, qualite suffisante sur JSON extraction
 // Pas active par defaut - utiliser options.light = true pour l'activer
 const MODEL_LIGHT = 'llama-3.1-8b-instant'
-
-// Alternatives prod en cas de rate-limit futur sur llama-3.3-70b :
-// - meta-llama/llama-4-scout-17b-16e-instruct (Llama 4 Scout - notre ancien)
-// - meta-llama/llama-4-maverick-17b-128e-instruct (Llama 4 Maverick)
-// - openai/gpt-oss-120b (modele OpenAI open-weight, contexte 128k+)
-// - groq/compound (Compound : web_search + code execution integres - virerait Tavily)
 
 async function callGroq(payload) {
   const res = await fetch(GROQ_URL, {
