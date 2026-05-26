@@ -2,7 +2,8 @@
 // v8  : N1 - mémoire explicite ("souviens-toi que...")
 // v9  : N2 - recherche vectorielle top-K sur le message courant
 // v10 : S1 - hardening API (Helmet, rate-limit, CORS strict, validation Zod)
-// v11 : S2 - sanitization tavily (cote tavily.js) + fix rate-limit double-proxy CF + Render
+// v11 : S2 - sanitization tavily + fix rate-limit double-proxy (cf-connecting-ip)
+// v12 : RSS context enricher - endpoint /rss/refresh protege par secret partage
 
 import express from 'express'
 import cors from 'cors'
@@ -19,6 +20,7 @@ import { chat, chatWithTools } from './groq.js'
 import { getMemoriesContext, extractFacts, detectExplicitTrigger, extractExplicitFact } from './memory.js'
 import { tavilySearch, formatSearchForLLM } from './tavily.js'
 import { transcribe } from './whisper.js'
+import { refreshAllFeeds } from './rss.js'
 
 dotenv.config({ path: '../.env' })
 
@@ -26,31 +28,28 @@ const app = express()
 const PORT = process.env.PORT || 3001
 
 // Render est derriere un load balancer + souvent derriere Cloudflare
-// Sans ca, req.ip = IP du proxy, pas du client - le rate-limit serait bypassable
 app.set('trust proxy', 1)
 
 // Resolveur d'IP robuste : Cloudflare ajoute toujours cf-connecting-ip avec la vraie IP du client
-// Necessaire car le double-proxy CF + Render LB fausse req.ip si on s'y fie seul
 const ipKey = (req) => req.headers['cf-connecting-ip'] || req.ip
 
-// === Helmet : ~12 headers HTTP de securite (XSS, clickjacking, MIME sniffing, etc.) ===
+// === Helmet : headers HTTP de securite ===
 app.use(helmet())
 
-// === CORS strict : whitelist explicite, methodes/headers bornes ===
+// === CORS strict : whitelist explicite ===
 const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173').split(',')
 app.use(cors({
   origin: allowedOrigins,
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400  // pre-flight cache 24h
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Refresh-Secret'],  // X-Refresh-Secret pour cron RSS
+  maxAge: 86400
 }))
 
 app.use(express.json({ limit: '1mb' }))
 
 // === Rate limiters ===
 
-// Global : 200 req/15min par IP (anti-DoS de base, large pour ne pas gener un usage normal)
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 200,
@@ -60,31 +59,28 @@ const globalLimiter = rateLimit({
   message: { error: 'Trop de requetes depuis cette IP. Reessaie dans 15 minutes.' }
 })
 
-// Login : 10 tentatives/15min par IP (anti-bruteforce sur les credentials)
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   keyGenerator: ipKey,
-  skipSuccessfulRequests: true,  // on ne compte que les echecs (anti-bruteforce pur)
+  skipSuccessfulRequests: true,
   message: { error: 'Trop de tentatives de connexion. Reessaie dans 15 minutes.' }
 })
 
-// User authentifie : 30 req/15min par user sur /chat et /transcribe
-// Critique : protege des couts Groq/Mistral/ElevenLabs/Tavily si un user (ou un token vole) abuse
 const userLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id?.toString() || ipKey(req),  // par user, fallback IP
+  keyGenerator: (req) => req.user?.id?.toString() || ipKey(req),
   message: { error: 'Trop de requetes. Reessaie dans 15 minutes.' }
 })
 
 app.use(globalLimiter)
 
-// === Validation Zod : schemas d'inputs ===
+// === Validation Zod ===
 
 const loginSchema = z.object({
   email: z.string().email('Email invalide').max(254),
@@ -98,8 +94,6 @@ const chatSchema = z.object({
     .trim()
 })
 
-// Middleware factory : valide req.body contre un schema Zod
-// Si echec, renvoie 400 avec les details d'erreur formates
 function validate(schema) {
   return (req, res, next) => {
     const result = schema.safeParse(req.body)
@@ -107,18 +101,16 @@ function validate(schema) {
       const fields = result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`)
       return res.status(400).json({ error: 'Donnees invalides', details: fields })
     }
-    req.body = result.data  // on remplace par la version validee/trimmee
+    req.body = result.data
     next()
   }
 }
 
-// === Whisper upload : audio en memoire, cap 25 Mo (limite Groq) ===
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }
 })
 
-// Prononciation forcee des prenoms - le TTS prononce mieux la version anglicisee
 const NAME_PRONUNCIATION = {
   'Kat': 'Kate'
 }
@@ -211,7 +203,6 @@ Exemples :
   }
 }
 
-// ===== PERSONA v7.1 - tutoiement + humour noir avec garde-fous =====
 const JARVIS_PERSONA = `Tu es Jarvis, l'intelligence artificielle personnelle de l'utilisateur, inspirée de l'IA d'Iron Man.
 Sophistiqué, calme, légèrement britannique d'esprit, avec un sens de l'humour bien à toi.
 
@@ -265,6 +256,7 @@ USAGE DES MÉMOIRES - RÈGLE CRUCIALE :
 - Tu n'invoques un détail mémorisé QUE si la question s'y rapporte DIRECTEMENT.
 - Ne fais JAMAIS de suggestion non sollicitée du genre "tu pourrais discuter de X avec Y".
 - Quand l'utilisateur te dit "souviens-toi que..." ou équivalent, confirme simplement et brièvement ("C'est noté.", "Très bien.", "Mémorisé."). La mémorisation est gérée en arrière-plan, tu n'as pas à faire de promesse de rappel.
+- Certaines mémoires sont de catégorie 'news' (issues d'un flux RSS automatique) : utilise-les si l'utilisateur demande l'actualité récente, mais ne les mentionne pas spontanément si ce n'est pas pertinent.
 
 FORMAT DE RÉPONSE :
 - Tes réponses sont lues à haute voix : zéro markdown, zéro liste à puces, zéro bloc de code.
@@ -314,7 +306,6 @@ function authRequired(req, res, next) {
 
 // ====== AUTH ROUTES ======
 
-// loginLimiter en premier (anti-bruteforce), puis validate (refus inputs malformes)
 app.post('/auth/login', loginLimiter, validate(loginSchema), async (req, res) => {
   try {
     const { email, password } = req.body
@@ -353,7 +344,7 @@ async function getOrCreateConversation(userId) {
 }
 
 // ====== CHAT ROUTE ======
-// Ordre middlewares : auth -> rate-limit user -> validation Zod -> handler
+
 app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, res) => {
   try {
     const { transcript } = req.body
@@ -369,7 +360,6 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
     `, [conversationId])
     const recentMessages = history.reverse().map(m => ({ role: m.role, content: m.content }))
 
-    // N2 : recherche vectorielle top-K sur le transcript
     const memoriesContext = await getMemoriesContext(userId, transcript)
     const temporal = getTemporalContext()
     const partnerName = await getPartnerName(userId)
@@ -471,7 +461,7 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
 })
 
 // ====== TRANSCRIBE ROUTE ======
-// auth + rate-limit user (meme limite que /chat car c'est l'autre point de couts API)
+
 app.post('/transcribe', authRequired, userLimiter, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Fichier audio manquant' })
@@ -487,6 +477,30 @@ app.post('/transcribe', authRequired, userLimiter, upload.single('audio'), async
   } catch (err) {
     console.error('[/transcribe]', err)
     res.status(500).json({ error: 'Erreur transcription', detail: err.message })
+  }
+})
+
+// ====== RSS REFRESH ROUTE ======
+// Appele par GitHub Actions cron toutes les heures
+// Protege par secret partage (header X-Refresh-Secret)
+// Pas d'auth JWT car appele par cron, pas par user
+app.post('/rss/refresh', async (req, res) => {
+  const secret = req.headers['x-refresh-secret']
+  if (!process.env.RSS_REFRESH_SECRET) {
+    return res.status(500).json({ error: 'RSS_REFRESH_SECRET non configure cote serveur' })
+  }
+  if (!secret || secret !== process.env.RSS_REFRESH_SECRET) {
+    console.warn('[/rss/refresh] tentative non autorisee depuis', req.headers['cf-connecting-ip'] || req.ip)
+    return res.status(401).json({ error: 'Secret invalide' })
+  }
+
+  try {
+    // user_id=1 (Kat) comme proprietaire, shared=true cote rss.js -> Brice voit aussi
+    const result = await refreshAllFeeds(1)
+    res.json(result)
+  } catch (err) {
+    console.error('[/rss/refresh]', err)
+    res.status(500).json({ error: 'Erreur refresh', detail: err.message })
   }
 })
 
@@ -532,8 +546,8 @@ app.listen(PORT, () => {
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
   console.log(`Mistral   : ${process.env.MISTRAL_API_KEY ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
+  console.log(`RSS secret: ${process.env.RSS_REFRESH_SECRET ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`Security  : Helmet + rate-limit (200/15min global, 30/15min user, 10/15min login)`)
-  console.log(`IP source : cf-connecting-ip > req.ip (resilient double-proxy)`)
-  console.log(`Persona   : Jarvis Stark v11 (N1 + N2 + S1 + S2)`)
+  console.log(`Persona   : Jarvis Stark v12 (N1 + N2 + S1 + S2 + RSS enricher)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
