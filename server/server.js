@@ -1,14 +1,16 @@
 // Backend Jarvis - API REST avec auth JWT
-// v8  : N1 - mémoire explicite ("souviens-toi que...")
-// v9  : N2 - recherche vectorielle top-K sur le message courant
-// v10 : S1 - hardening API (Helmet, rate-limit, CORS strict, validation Zod)
+// v8  : N1 - mémoire explicite
+// v9  : N2 - recherche vectorielle top-K
+// v10 : S1 - hardening API (Helmet, rate-limit, CORS strict, Zod)
 // v11 : S2 - sanitization tavily + fix rate-limit double-proxy (cf-connecting-ip)
-// v12 : RSS context enricher - endpoint /rss/refresh protege par secret partage
+// v12 : RSS context enricher - endpoint /rss/refresh + cron GitHub Actions
+// v13 : S3 - audit & quotas (logs structurés, quota tokens/user, endpoint /admin/usage)
+//       Switch modèle vers GPT-OSS 120B + fix ERR_ERL_KEY_GEN_IPV6 (ipKeyGenerator)
 
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import dotenv from 'dotenv'
@@ -21,17 +23,27 @@ import { getMemoriesContext, extractFacts, detectExplicitTrigger, extractExplici
 import { tavilySearch, formatSearchForLLM } from './tavily.js'
 import { transcribe } from './whisper.js'
 import { refreshAllFeeds } from './rss.js'
+import { logUsage, checkQuota, getAdminStats, DAILY_QUOTA_TOKENS } from './usage.js'
 
 dotenv.config({ path: '../.env' })
 
 const app = express()
 const PORT = process.env.PORT || 3001
 
-// Render est derriere un load balancer + souvent derriere Cloudflare
+// Render derriere LB + Cloudflare devant
 app.set('trust proxy', 1)
 
-// Resolveur d'IP robuste : Cloudflare ajoute toujours cf-connecting-ip avec la vraie IP du client
-const ipKey = (req) => req.headers['cf-connecting-ip'] || req.ip
+// Resolveur d'IP robuste : Cloudflare ajoute cf-connecting-ip avec la vraie IP
+// ipKeyGenerator normalise les IPv6 (mask /64) pour eviter le bypass par changement de bits
+// Fix l'avertissement ERR_ERL_KEY_GEN_IPV6 d'express-rate-limit
+const ipKey = (req) => {
+  const rawIp = req.headers['cf-connecting-ip'] || req.ip
+  return ipKeyGenerator(rawIp)
+}
+
+// Set des user_id ayant acces aux endpoints admin (Kat=1, Brice=2)
+// Pour ajouter un user admin plus tard : juste un push ici, pas besoin de migration DB
+const ADMIN_USER_IDS = new Set([1, 2])
 
 // === Helmet : headers HTTP de securite ===
 app.use(helmet())
@@ -42,7 +54,7 @@ app.use(cors({
   origin: allowedOrigins,
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Refresh-Secret'],  // X-Refresh-Secret pour cron RSS
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Refresh-Secret'],
   maxAge: 86400
 }))
 
@@ -291,7 +303,7 @@ function applyNamePronunciation(text) {
   return result
 }
 
-// ====== AUTH MIDDLEWARE ======
+// ====== AUTH MIDDLEWARES ======
 
 function authRequired(req, res, next) {
   const header = req.headers.authorization
@@ -302,6 +314,15 @@ function authRequired(req, res, next) {
   } catch (e) {
     res.status(401).json({ error: 'Token invalide ou expire' })
   }
+}
+
+// Admin requis : Kat et Brice uniquement (set ADMIN_USER_IDS)
+// A utiliser APRES authRequired pour que req.user soit dispo
+function adminRequired(req, res, next) {
+  if (!req.user?.id || !ADMIN_USER_IDS.has(req.user.id)) {
+    return res.status(403).json({ error: 'Acces admin requis' })
+  }
+  next()
 }
 
 // ====== AUTH ROUTES ======
@@ -346,10 +367,23 @@ async function getOrCreateConversation(userId) {
 // ====== CHAT ROUTE ======
 
 app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, res) => {
+  const userId = req.user.id
+  const userName = req.user.name
+
+  // === S3 : check quota tokens AVANT l'appel LLM ===
+  const quota = await checkQuota(userId)
+  if (quota.exceeded) {
+    console.warn(`[/chat] quota tokens depasse pour user ${userId}: ${quota.used}/${quota.limit}`)
+    await logUsage({ userId, endpoint: 'chat', statusCode: 429, errorMsg: 'quota exceeded' })
+    return res.status(429).json({
+      error: 'Quota tokens quotidien depasse. Reset a minuit UTC.',
+      used: quota.used,
+      limit: quota.limit
+    })
+  }
+
   try {
     const { transcript } = req.body
-    const userId = req.user.id
-    const userName = req.user.name
     const conversationId = await getOrCreateConversation(userId)
 
     const { rows: history } = await query(`
@@ -406,9 +440,13 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
       }
     }
 
-    const { content: rawReply, toolsCalled } = await chatWithTools(
+    // === S3 : recupere usage + model du retour ===
+    const { content: rawReply, toolsCalled, usage, model } = await chatWithTools(
       messages, tools, toolExecutors, { temperature: 0.8 }
     )
+
+    // Log usage chat principal (apres succes)
+    logUsage({ userId, endpoint: 'chat', model, usage, statusCode: 200 })
 
     const reply = applyNamePronunciation(rawReply)
 
@@ -452,10 +490,13 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
         hour: parseInt(alarmCall.args.hour, 10),
         minute: parseInt(alarmCall.args.minute, 10) || 0,
         label: alarmCall.args.label || null
-      } : null
+      } : null,
+      // Bonus : on remonte au front le quota restant (utile pour afficher une jauge)
+      quota_remaining: Math.max(0, quota.remaining - (usage?.total_tokens || 0))
     })
   } catch (err) {
     console.error('[/chat]', err)
+    logUsage({ userId, endpoint: 'chat', statusCode: 500, errorMsg: err.message })
     res.status(500).json({ error: 'Erreur serveur', detail: err.message })
   }
 })
@@ -463,6 +504,7 @@ Tu parles à ${userName}. ${partnerInfo}${pronunciationHint}${memoriesContext}`
 // ====== TRANSCRIBE ROUTE ======
 
 app.post('/transcribe', authRequired, userLimiter, upload.single('audio'), async (req, res) => {
+  const userId = req.user.id
   try {
     if (!req.file?.buffer?.length) return res.status(400).json({ error: 'Fichier audio manquant' })
 
@@ -471,38 +513,47 @@ app.post('/transcribe', authRequired, userLimiter, upload.single('audio'), async
       filename: req.file.originalname || 'voice.webm',
       language: 'fr'
     })
-    console.log(`[transcribe] ${req.file.size}B -> "${text.slice(0, 60)}" (${Date.now() - t0}ms)`)
+    const elapsed = Date.now() - t0
+    console.log(`[transcribe] ${req.file.size}B -> "${text.slice(0, 60)}" (${elapsed}ms)`)
+
+    // Whisper ne remonte pas d'usage tokens - on logue juste l'appel
+    // total_tokens=0 mais on garde la trace (latence visible via timestamp)
+    logUsage({ userId, endpoint: 'transcribe', model: 'whisper-large-v3-turbo', statusCode: 200 })
 
     res.json({ text })
   } catch (err) {
     console.error('[/transcribe]', err)
+    logUsage({ userId, endpoint: 'transcribe', model: 'whisper-large-v3-turbo', statusCode: 500, errorMsg: err.message })
     res.status(500).json({ error: 'Erreur transcription', detail: err.message })
   }
 })
 
 // ====== RSS REFRESH ROUTE ======
-// Appele par GitHub Actions cron toutes les heures
-// Protege par secret partage (header X-Refresh-Secret)
-// Pas d'auth JWT car appele par cron, pas par user
+
 app.post('/rss/refresh', async (req, res) => {
   const secret = req.headers['x-refresh-secret']
   if (!process.env.RSS_REFRESH_SECRET) {
     return res.status(500).json({ error: 'RSS_REFRESH_SECRET non configure cote serveur' })
   }
   if (!secret || secret !== process.env.RSS_REFRESH_SECRET) {
-    console.warn('[/rss/refresh] tentative non autorisee depuis', req.headers['cf-connecting-ip'] || req.ip)
+    console.warn('[/rss/refresh] tentative non autorisee depuis', ipKey(req))
     return res.status(401).json({ error: 'Secret invalide' })
   }
 
   try {
-    // user_id=1 (Kat) comme proprietaire, shared=true cote rss.js -> Brice voit aussi
     const result = await refreshAllFeeds(1)
+    // Log usage : refresh consomme Mistral pas Groq, donc tokens=0 (Mistral free tier non compte ici)
+    // On garde quand meme la trace de l'appel cron pour audit
+    logUsage({ userId: null, endpoint: 'rss_refresh', statusCode: 200 })
     res.json(result)
   } catch (err) {
     console.error('[/rss/refresh]', err)
+    logUsage({ userId: null, endpoint: 'rss_refresh', statusCode: 500, errorMsg: err.message })
     res.status(500).json({ error: 'Erreur refresh', detail: err.message })
   }
 })
+
+// ====== ROUTES UTILITAIRES ======
 
 app.get('/history', authRequired, async (req, res) => {
   try {
@@ -534,12 +585,34 @@ app.get('/memories', authRequired, async (req, res) => {
   }
 })
 
+// === S3 : Endpoint admin pour voir la conso et les erreurs ===
+// Reserve aux users dans ADMIN_USER_IDS (Kat=1, Brice=2)
+app.get('/admin/usage', authRequired, adminRequired, async (req, res) => {
+  try {
+    const stats = await getAdminStats()
+    res.json(stats)
+  } catch (err) {
+    console.error('[/admin/usage]', err)
+    res.status(500).json({ error: 'Erreur serveur' })
+  }
+})
+
+// Endpoint pour qu'un user voit son propre quota (pour afficher une jauge front)
+app.get('/usage/me', authRequired, async (req, res) => {
+  try {
+    const quota = await checkQuota(req.user.id)
+    res.json(quota)
+  } catch (err) {
+    res.status(500).json({ error: 'Erreur serveur' })
+  }
+})
+
 app.get('/health', (req, res) => res.json({ ok: true, t: Date.now() }))
 
 app.listen(PORT, () => {
   console.log(`\n=== Jarvis API ===`)
   console.log(`Port      : ${PORT}`)
-  console.log(`LLM       : Groq (llama-3.3-70b-versatile)`)
+  console.log(`LLM       : Groq (openai/gpt-oss-120b)`)
   console.log(`Whisper   : whisper-large-v3-turbo (via Groq)`)
   console.log(`Embeddings: mistral-embed (via Mistral La Plateforme)`)
   console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé (sanitized)' : 'NON CONFIGURÉ ⚠️'}`)
@@ -548,6 +621,8 @@ app.listen(PORT, () => {
   console.log(`Mistral   : ${process.env.MISTRAL_API_KEY ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`RSS secret: ${process.env.RSS_REFRESH_SECRET ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`Security  : Helmet + rate-limit (200/15min global, 30/15min user, 10/15min login)`)
-  console.log(`Persona   : Jarvis Stark v12 (N1 + N2 + S1 + S2 + RSS enricher)`)
+  console.log(`Quota     : ${DAILY_QUOTA_TOKENS.toLocaleString()} tokens/user/jour`)
+  console.log(`Admin IDs : [${Array.from(ADMIN_USER_IDS).join(', ')}]`)
+  console.log(`Persona   : Jarvis Stark v13 (N1 + N2 + S1 + S2 + RSS + S3 audit)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })

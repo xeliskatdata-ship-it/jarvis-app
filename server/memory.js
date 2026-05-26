@@ -3,12 +3,14 @@
 // - extractFacts : analyse l'echange et stocke 0-3 faits importants (appele en background)
 // - detectExplicitTrigger / extractExplicitFact : N1, memoire forcee par phrase declencheur
 // v4 : N2 - recherche vectorielle via mistral-embed + pgvector cosine
+// v5 : adaptation au nouveau retour { content, usage, model } de chat() + logging S3
 
 import { query } from './db.js'
 import { chat } from './groq.js'
 import { embed, toPgVector } from './mistral.js'
+import { logUsage } from './usage.js'
 
-const TOP_K = 8  // nombre de memoires auto rapatriees par recherche vectorielle
+const TOP_K = 8
 
 // === N1 : declencheurs linguistiques pour memoire forcee ===
 const EXPLICIT_TRIGGERS = /\b(souviens[- ]toi (que|de)|n['']oublie pas (que|de)|rappelle[- ]toi (que|de)|retiens (bien )?(que|ceci)|note (bien )?(que|ceci)|memorise (que|ceci)|remember (that|this)|don['']t forget (that|this)|memorize (that|this))\b/i
@@ -19,8 +21,6 @@ export function detectExplicitTrigger(message) {
 }
 
 // === N2 : recuperation du contexte memoire ===
-// - explicit : toutes les memoires marquees explicit (priorite cognitive haute)
-// - auto : top-K semantiquement proches du message courant (recherche vectorielle cosine)
 export async function getMemoriesContext(userId, currentMessage = '') {
   // 1. Memoires explicites - toujours toutes injectees (max 20 pour bornage)
   const { rows: explicitRows } = await query(`
@@ -41,8 +41,6 @@ export async function getMemoriesContext(userId, currentMessage = '') {
       const [queryEmb] = await embed(currentMessage)
       const queryVec = toPgVector(queryEmb)
 
-      // Operator <=> = distance cosine (0 = identique, 2 = opposes)
-      // similarity = 1 - distance (1 = identique, -1 = opposes)
       const { rows } = await query(`
         SELECT m.id, m.fact, m.category, m.importance, m.shared, m.source, m.user_id,
                u.name as owner_name,
@@ -57,7 +55,6 @@ export async function getMemoriesContext(userId, currentMessage = '') {
       `, [userId, queryVec, TOP_K])
       autoRows = rows
 
-      // Log de debug : top et bottom similarites du batch retourne
       if (rows.length > 0) {
         const topSim = Number(rows[0].similarity).toFixed(3)
         const lowSim = Number(rows[rows.length - 1].similarity).toFixed(3)
@@ -68,18 +65,15 @@ export async function getMemoriesContext(userId, currentMessage = '') {
       autoRows = await fetchAutoFallback(userId)
     }
   } else {
-    // Pas de message courant (cas init ou greeting vide) : fallback non-semantique
     autoRows = await fetchAutoFallback(userId)
   }
 
   const allRows = [...explicitRows, ...autoRows]
   if (allRows.length === 0) return ''
 
-  // Groupement par categorie pour un contexte plus lisible par le LLM
   const grouped = {}
   for (const r of allRows) {
     const ownerTag = r.shared && r.user_id !== userId ? ` [partage par ${r.owner_name}]` : ''
-    // Marqueur visuel pour memoires explicites - le LLM doit y accorder plus de poids
     const explicitTag = r.source === 'explicit' ? 'IMPORTANT - ' : ''
     const line = `- ${explicitTag}${r.fact}${ownerTag}`
     if (!grouped[r.category]) grouped[r.category] = []
@@ -95,8 +89,7 @@ export async function getMemoriesContext(userId, currentMessage = '') {
     }
   }
 
-  // Touch last_used_at SEULEMENT sur les memoires effectivement injectees
-  // (avant on touchait toutes les memoires de l'user, ce qui rendait le signal inutile)
+  // Touch last_used_at uniquement sur les memoires effectivement injectees
   const usedIds = allRows.map(r => r.id).filter(Boolean)
   if (usedIds.length > 0) {
     query(`UPDATE memories SET last_used_at = NOW() WHERE id = ANY($1::int[])`, [usedIds])
@@ -106,7 +99,6 @@ export async function getMemoriesContext(userId, currentMessage = '') {
   return `\n\n=== Ce que tu connais de cette personne ===\n${sections.join('\n\n')}\n=== Fin memoires ===`
 }
 
-// Fallback non-semantique - utilise si pas de message courant ou si l'embedding plante
 async function fetchAutoFallback(userId) {
   const { rows } = await query(`
     SELECT m.id, m.fact, m.category, m.importance, m.shared, m.source, m.user_id,
@@ -147,10 +139,14 @@ REGLES :
 - Si vraiment rien d'extractable, retourne {"facts": []}`
 
   try {
-    const raw = await chat([
+    // Nouvelle signature : chat() retourne { content, usage, model }
+    const { content: raw, usage, model } = await chat([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userMessage }
     ], { json: true, temperature: 0.2, max_tokens: 300 })
+
+    // Log usage (background, ne doit jamais casser le flow)
+    logUsage({ userId, endpoint: 'extract_explicit', model, usage, statusCode: 200 })
 
     const parsed = JSON.parse(raw)
     const facts = Array.isArray(parsed.facts) ? parsed.facts : []
@@ -168,7 +164,7 @@ REGLES :
       return []
     }
 
-    // Calcul des embeddings en batch (1 appel API meme si plusieurs faits)
+    // Calcul des embeddings en batch
     const texts = validFacts.map(f => f.fact.trim())
     let embeddings = null
     try {
@@ -188,7 +184,6 @@ REGLES :
           VALUES ($1, $2, $3, 9, $4, 'explicit', $5::vector)
         `, [userId, f.fact.trim(), cat, !!f.shared, toPgVector(embeddings[i])])
       } else {
-        // Fallback : insert sans embedding si Mistral down (retrouvable plus tard via backfill)
         await query(`
           INSERT INTO memories (user_id, fact, category, importance, shared, source)
           VALUES ($1, $2, $3, 9, $4, 'explicit')
@@ -201,6 +196,8 @@ REGLES :
     return validFacts
   } catch (err) {
     console.warn('[memory N1] extraction explicite echouee:', err.message)
+    // Log erreur usage aussi (pas de tokens consommes mais on garde trace)
+    logUsage({ userId, endpoint: 'extract_explicit', model: null, statusCode: 500, errorMsg: err.message })
     return []
   }
 }
@@ -247,10 +244,12 @@ Si rien a memoriser, retourne {"facts": []}.`
   const userContent = `Utilisateur : "${userMessage}"\n\nJarvis : "${assistantMessage}"`
 
   try {
-    const raw = await chat([
+    const { content: raw, usage, model } = await chat([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent }
     ], { json: true, temperature: 0.3, max_tokens: 500 })
+
+    logUsage({ userId, endpoint: 'extract_facts', model, usage, statusCode: 200 })
 
     const parsed = JSON.parse(raw)
     const facts = Array.isArray(parsed.facts) ? parsed.facts : []
@@ -265,7 +264,6 @@ Si rien a memoriser, retourne {"facts": []}.`
 
     if (validFacts.length === 0) return []
 
-    // Calcul des embeddings en batch
     const texts = validFacts.map(f => f.fact.trim())
     let embeddings = null
     try {
@@ -298,6 +296,7 @@ Si rien a memoriser, retourne {"facts": []}.`
     return validFacts
   } catch (err) {
     console.warn('[memory] extraction echouee:', err.message)
+    logUsage({ userId, endpoint: 'extract_facts', model: null, statusCode: 500, errorMsg: err.message })
     return []
   }
 }
