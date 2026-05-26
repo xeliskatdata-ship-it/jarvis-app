@@ -2,6 +2,7 @@
 // v8  : N1 - mémoire explicite ("souviens-toi que...")
 // v9  : N2 - recherche vectorielle top-K sur le message courant
 // v10 : S1 - hardening API (Helmet, rate-limit, CORS strict, validation Zod)
+// v11 : S2 - sanitization tavily (cote tavily.js) + fix rate-limit double-proxy CF + Render
 
 import express from 'express'
 import cors from 'cors'
@@ -24,9 +25,13 @@ dotenv.config({ path: '../.env' })
 const app = express()
 const PORT = process.env.PORT || 3001
 
-// Render est derriere un load balancer - sans ca, req.ip = IP du proxy, pas du client
-// Necessaire pour que les rate-limiters voient la vraie IP via X-Forwarded-For
+// Render est derriere un load balancer + souvent derriere Cloudflare
+// Sans ca, req.ip = IP du proxy, pas du client - le rate-limit serait bypassable
 app.set('trust proxy', 1)
+
+// Resolveur d'IP robuste : Cloudflare ajoute toujours cf-connecting-ip avec la vraie IP du client
+// Necessaire car le double-proxy CF + Render LB fausse req.ip si on s'y fie seul
+const ipKey = (req) => req.headers['cf-connecting-ip'] || req.ip
 
 // === Helmet : ~12 headers HTTP de securite (XSS, clickjacking, MIME sniffing, etc.) ===
 app.use(helmet())
@@ -51,6 +56,7 @@ const globalLimiter = rateLimit({
   limit: 200,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  keyGenerator: ipKey,
   message: { error: 'Trop de requetes depuis cette IP. Reessaie dans 15 minutes.' }
 })
 
@@ -60,6 +66,7 @@ const loginLimiter = rateLimit({
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  keyGenerator: ipKey,
   skipSuccessfulRequests: true,  // on ne compte que les echecs (anti-bruteforce pur)
   message: { error: 'Trop de tentatives de connexion. Reessaie dans 15 minutes.' }
 })
@@ -71,7 +78,7 @@ const userLimiter = rateLimit({
   limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  keyGenerator: (req) => req.user?.id?.toString() || req.ip,  // par user authentifie, fallback IP
+  keyGenerator: (req) => req.user?.id?.toString() || ipKey(req),  // par user, fallback IP
   message: { error: 'Trop de requetes. Reessaie dans 15 minutes.' }
 })
 
@@ -521,11 +528,12 @@ app.listen(PORT, () => {
   console.log(`LLM       : Groq (llama-3.3-70b-versatile)`)
   console.log(`Whisper   : whisper-large-v3-turbo (via Groq)`)
   console.log(`Embeddings: mistral-embed (via Mistral La Plateforme)`)
-  console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé' : 'NON CONFIGURÉ ⚠️'}`)
+  console.log(`Web search: ${process.env.TAVILY_API_KEY ? 'Tavily activé (sanitized)' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`DB        : ${process.env.DATABASE_URL ? 'connectée' : 'NON CONFIGURÉE ⚠️'}`)
   console.log(`JWT       : ${process.env.JWT_SECRET?.length >= 32 ? 'OK' : 'TROP COURT ⚠️'}`)
   console.log(`Mistral   : ${process.env.MISTRAL_API_KEY ? 'OK' : 'NON CONFIGURÉ ⚠️'}`)
   console.log(`Security  : Helmet + rate-limit (200/15min global, 30/15min user, 10/15min login)`)
-  console.log(`Persona   : Jarvis Stark v10 (N1 + N2 vectoriel + hardening API)`)
+  console.log(`IP source : cf-connecting-ip > req.ip (resilient double-proxy)`)
+  console.log(`Persona   : Jarvis Stark v11 (N1 + N2 + S1 + S2)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
