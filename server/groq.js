@@ -11,7 +11,7 @@ const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 // - Tool calling solide (#1 sur BFCL parmi les modeles open-source)
 // - Quota free tier separe de Llama 4 (= debloque la situation actuelle de Kat)
 // - 128k context
-const MODEL = 'llama-3.3-70b-versatile'
+const MODEL = 'meta-llama/llama-4-maverick-17b-128e-instruct'
 
 // Modele leger pour taches structurees en background (extraction de faits)
 // ~9x moins de tokens consommes que le 70B, qualite suffisante sur JSON extraction
