@@ -12,7 +12,8 @@ const VOICE_SETTINGS = {
   stability: 0.35,
   similarity_boost: 0.85,
   style: 0.5,
-  use_speaker_boost: true
+  use_speaker_boost: true,
+  speed: 1.20
 }
 
 // Reduit a 2 messages visibles (au lieu de 4)
