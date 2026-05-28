@@ -2,7 +2,22 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
-const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb'
+
+// Voice Wall-E par defaut (timbre choisi par Kat)
+// Si tu veux changer rapidement la voix, modifie ce voice_id OU passe par Settings UI
+const DEFAULT_VOICE_ID = 'pNInz6obpgDQGcFmaJgB'  // Adam 
+
+// Presets voice_settings ElevenLabs - tunes a la perception
+// stability bas -> voix qui varie, hesite, monte (effet enfantin/expressif)
+// similarity haut -> reste fidele au timbre choisi
+// style moyen-haut -> exagere l'expressivite (ton joueur)
+const VOICE_SETTINGS = {
+  stability: 0.35,
+  similarity_boost: 0.85,
+  style: 0.5,
+  use_speaker_boost: true
+}
+
 const VISIBLE_MESSAGES = 4
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
@@ -104,7 +119,7 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [notification, setNotification] = useState(null)
   const [now, setNow] = useState(Date.now())
 
-  // État de l'autorisation des notifications système (granted / denied / default / unsupported)
+  // Etat de l'autorisation des notifications systeme (granted / denied / default / unsupported)
   const [notifPermission, setNotifPermission] = useState(
     typeof window !== 'undefined' && 'Notification' in window
       ? Notification.permission
@@ -208,40 +223,37 @@ export default function JarvisInterface({ auth, onLogout }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isProcessing])
 
-  // Demande l'autorisation des notifications système - doit être appelée dans un user gesture (Safari)
+  // Demande l'autorisation des notifications systeme - doit etre appelee dans un user gesture (Safari)
   const requestNotifPermission = async () => {
     if (!('Notification' in window)) return
-    if (Notification.permission !== 'default') return  // déjà décidé une fois, on insiste pas
+    if (Notification.permission !== 'default') return  // deja decide une fois, on insiste pas
     try {
       const result = await Notification.requestPermission()
       setNotifPermission(result)
     } catch (e) {
-      // ancien navigateurs : requestPermission n'était pas une promise
+      // ancien navigateurs : requestPermission n'etait pas une promise
     }
   }
 
-  // Envoie une vraie notif OS si l'utilisateur a accordé la permission - silencieux sinon
+  // Envoie une vraie notif OS si l'utilisateur a accorde la permission - silencieux sinon
   const sendSystemNotification = (message) => {
     if (!('Notification' in window) || Notification.permission !== 'granted') return
-    // Split "Minuteur terminé : pâtes" en titre + body pour un meilleur rendu OS
     const [titlePart, ...bodyParts] = message.split(' : ')
     const body = bodyParts.length > 0
       ? bodyParts.join(' : ')
-      : 'Reviens sur Jarvis pour arrêter la sonnerie'
+      : 'Reviens sur Jarvis pour arreter la sonnerie'
     try {
       const notif = new Notification(`Jarvis — ${titlePart}`, {
         body,
-        tag: 'jarvis-alarm',          // remplace toute notif précédente du même tag
-        requireInteraction: true,      // reste visible sur desktop jusqu'au clic
+        tag: 'jarvis-alarm',
+        requireInteraction: true,
         vibrate: [200, 100, 200, 100, 200]
       })
       notif.onclick = () => {
-        window.focus()  // ramène l'onglet au premier plan
+        window.focus()
         notif.close()
       }
-    } catch (e) {
-      // certains navigateurs throw si appelé depuis un onglet en arrière-plan sans permission
-    }
+    } catch (e) {}
   }
 
   const playBeep = () => {
@@ -278,7 +290,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // Déclenche tout : bips répétés + banner + notif OS (si permission accordée)
   const fireNotification = (message) => {
     startBeepLoop()
     setNotification(message)
@@ -298,7 +309,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         const due = prev.filter(e => e.firesAt <= t)
         if (due.length === 0) return prev
         due.forEach(e => {
-          const base = e.type === 'timer' ? 'Minuteur terminé' : 'Alarme'
+          const base = e.type === 'timer' ? 'Minuteur termine' : 'Alarme'
           fireNotification(`${base}${e.label ? ` : ${e.label}` : ''}`)
         })
         return prev.filter(e => e.firesAt > t)
@@ -362,7 +373,7 @@ export default function JarvisInterface({ auth, onLogout }) {
     if (playPromise && typeof playPromise.catch === 'function') {
       playPromise.catch(err => {
         setIsJarvisSpeaking(false)
-        setError(`play() bloqué: ${err.name} - ${(err.message || '').slice(0, 80)}`)
+        setError(`play() bloque: ${err.name} - ${(err.message || '').slice(0, 80)}`)
       })
     }
   }
@@ -399,6 +410,8 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
+  // Appel ElevenLabs avec preset enfantin/joueur (cf VOICE_SETTINGS en haut de fichier)
+  // Pour ajuster a l'oreille : modifier VOICE_SETTINGS et reload Vite
   const synthesizeElevenLabs = async (text) => {
     try {
       const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
@@ -407,7 +420,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         body: JSON.stringify({
           text,
           model_id: 'eleven_multilingual_v2',
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+          voice_settings: VOICE_SETTINGS
         })
       })
       if (!res.ok) throw new Error(`ElevenLabs ${res.status}`)
@@ -421,7 +434,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         playAudioUrl(URL.createObjectURL(blob))
       }
     } catch (err) {
-      console.warn('TTS ElevenLabs échec, fallback navigateur:', err.message)
+      console.warn('TTS ElevenLabs echec, fallback navigateur:', err.message)
       speakWithBrowser(text)
     }
   }
@@ -443,7 +456,7 @@ export default function JarvisInterface({ auth, onLogout }) {
         throw new Error(errData.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
-      const reply = data.reply || "Pas de réponse reçue."
+      const reply = data.reply || "Pas de reponse recue."
       setMessages(prev => [...prev, { role: 'jarvis', content: reply, ts: Date.now() }])
 
       if (data.timer) addTimer(data.timer.duration_seconds, data.timer.label)
@@ -517,7 +530,7 @@ export default function JarvisInterface({ auth, onLogout }) {
       }
       const { text } = await res.json()
       if (!text?.trim()) {
-        setError("Je n'ai rien entendu, réessaie en parlant plus distinctement")
+        setError("Je n'ai rien entendu, reessaie en parlant plus distinctement")
         setIsProcessing(false)
         return
       }
@@ -562,7 +575,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         audioSourceRef.current = null
       }
       setIsJarvisSpeaking(false)
-      // Le premier clic micro = bon moment pour unlock audio iOS ET demander permission notif (user gesture)
       unlockAudioIOS()
       requestNotifPermission()
       startRecording()
@@ -575,7 +587,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                  : 'idle'
 
   const statusLabel = isJarvisSpeaking ? 'jarvis parle'
-                    : isListening ? 'écoute active'
+                    : isListening ? 'ecoute active'
                     : isProcessing ? 'traitement'
                     : `bonjour ${auth.user.name.toLowerCase()}`
 
@@ -699,7 +711,7 @@ export default function JarvisInterface({ auth, onLogout }) {
 
         <button onClick={() => setShowSettings(true)}
                 className="p-2 rounded-full hover:bg-white/5 transition-colors text-[#6b6b78] hover:text-[#e8e8ec]"
-                aria-label="Paramètres">
+                aria-label="Parametres">
           <Settings size={18} strokeWidth={1.5} />
         </button>
       </header>
@@ -805,7 +817,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                 ${isListening
                   ? 'bg-[#5b9eff] glow-accent scale-110'
                   : 'bg-white/5 hover:bg-white/10 border border-white/10 hover:border-[#5b9eff]/40'}`}
-              aria-label={isListening ? 'Arrêter' : 'Démarrer'}
+              aria-label={isListening ? 'Arreter' : 'Demarrer'}
             >
               <Mic size={28} strokeWidth={1.5} className={isListening ? 'text-[#06060a]' : 'text-[#e8e8ec]'} />
             </button>
@@ -817,12 +829,12 @@ export default function JarvisInterface({ auth, onLogout }) {
               className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-500/20 border border-red-500/40 hover:bg-red-500/30 text-red-300 font-mono text-xs uppercase tracking-[0.2em] msg-in alarm-pulse"
             >
               <BellOff size={14} />
-              Arrêter la sonnerie
+              Arreter la sonnerie
             </button>
           )}
 
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-[#6b6b78]">
-            {isListening ? 'cliquez pour arrêter' :
+            {isListening ? 'cliquez pour arreter' :
              isJarvisSpeaking ? 'cliquez pour interrompre' :
              isProcessing ? '...' : 'cliquez pour parler'}
           </p>
@@ -858,7 +870,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                   className="w-full px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-[#5b9eff]/50 focus:outline-none font-mono text-sm text-[#e8e8ec] placeholder-[#3a3a44]"
                 />
                 <p className="font-mono text-[10px] text-[#6b6b78] mt-2">
-                  Sans clé : voix navigateur. Avec clé : voix "George" (UK posh, vibe Jarvis).
+                  Sans cle : voix navigateur. Avec cle : voix Wall-E (enfantine, joueuse).
                 </p>
               </div>
 
@@ -872,32 +884,32 @@ export default function JarvisInterface({ auth, onLogout }) {
                   className="w-full px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-[#5b9eff]/50 focus:outline-none font-mono text-sm text-[#e8e8ec]"
                 />
                 <p className="font-mono text-[10px] text-[#6b6b78] mt-2">
-                  George (UK, défaut) · Daniel: onwK4e9ZLuTAKqWW03F9 · Adam: pNInz6obpgDQGcFmaJgB
+                  Wall-E (defaut) · George (Jarvis): JBFqnCBsd6RMkjVDRZzb · Daniel: onwK4e9ZLuTAKqWW03F9 · Adam: pNInz6obpgDQGcFmaJgB
                 </p>
               </div>
 
               <div className="pt-4 border-t border-white/5">
                 <label className="block font-mono text-[10px] uppercase tracking-[0.2em] text-[#6b6b78] mb-2">
-                  Notifications système
+                  Notifications systeme
                 </label>
                 <div className="px-4 py-3 rounded-lg bg-black/40 border border-white/10 font-mono text-xs">
-                  {notifPermission === 'granted' && <span className="text-green-400">✓ Activées — tu seras prévenue même onglet en arrière-plan</span>}
-                  {notifPermission === 'denied' && <span className="text-red-300">✗ Bloquées — autorise-les dans les réglages du navigateur pour ce site</span>}
-                  {notifPermission === 'default' && <span className="text-[#6b6b78]">⋯ Pas encore demandées — clique sur le micro pour activer</span>}
-                  {notifPermission === 'unsupported' && <span className="text-[#6b6b78]">Non supportées par ce navigateur</span>}
+                  {notifPermission === 'granted' && <span className="text-green-400">✓ Activees — tu seras prevenue meme onglet en arriere-plan</span>}
+                  {notifPermission === 'denied' && <span className="text-red-300">✗ Bloquees — autorise-les dans les reglages du navigateur pour ce site</span>}
+                  {notifPermission === 'default' && <span className="text-[#6b6b78]">⋯ Pas encore demandees — clique sur le micro pour activer</span>}
+                  {notifPermission === 'unsupported' && <span className="text-[#6b6b78]">Non supportees par ce navigateur</span>}
                 </div>
               </div>
 
               <div className="pt-4 border-t border-white/5 space-y-2">
                 <p className="font-mono text-[10px] text-[#6b6b78]">
-                  Connecté en tant que <span className="text-[#e8e8ec]">{auth.user.name}</span> ({auth.user.email})
+                  Connecte en tant que <span className="text-[#e8e8ec]">{auth.user.name}</span> ({auth.user.email})
                 </p>
                 <button
                   onClick={() => { setShowSettings(false); onLogout() }}
                   className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-red-500/30 text-red-300 hover:bg-red-500/10 transition-colors font-mono text-xs uppercase tracking-[0.2em]"
                 >
                   <LogOut size={14} />
-                  Déconnexion
+                  Deconnexion
                 </button>
               </div>
             </div>
