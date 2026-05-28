@@ -5,7 +5,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
 // Voice Wall-E par defaut (timbre choisi par Kat)
 // Si tu veux changer rapidement la voix, modifie ce voice_id OU passe par Settings UI
-const DEFAULT_VOICE_ID = 'pNInz6obpgDQGcFmaJgB'  // Adam 
+const DEFAULT_VOICE_ID = 'pzMUt9WXzANV4Hu6SUkA'  // creation voix dans ElevenLabs 
 
 // Presets voice_settings ElevenLabs - tunes a la perception
 // stability bas -> voix qui varie, hesite, monte (effet enfantin/expressif)
