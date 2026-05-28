@@ -1,16 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
+import WalleAvatar from './WalleAvatar'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
 // Voice Wall-E par defaut (timbre choisi par Kat)
-// Si tu veux changer rapidement la voix, modifie ce voice_id OU passe par Settings UI
-const DEFAULT_VOICE_ID = 'pzMUt9WXzANV4Hu6SUkA'  // creation voix dans ElevenLabs 
+const DEFAULT_VOICE_ID = 'pzMUt9WXzANV4Hu6SUkA'
 
-// Presets voice_settings ElevenLabs - tunes a la perception
-// stability bas -> voix qui varie, hesite, monte (effet enfantin/expressif)
-// similarity haut -> reste fidele au timbre choisi
-// style moyen-haut -> exagere l'expressivite (ton joueur)
+// Presets voice_settings ElevenLabs - effet enfantin/joueur
 const VOICE_SETTINGS = {
   stability: 0.35,
   similarity_boost: 0.85,
@@ -18,10 +15,34 @@ const VOICE_SETTINGS = {
   use_speaker_boost: true
 }
 
-const VISIBLE_MESSAGES = 4
+// Reduit a 2 messages visibles (au lieu de 4)
+const VISIBLE_MESSAGES = 2
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 const eventsKey = (userId) => `jarvis_events_${userId}`
+
+// Pattern d'etoiles pour le fond spatial - 18 etoiles reparties dans une tuile
+// Tons varies : blanc neutre, blanc-bleute, ambre tres clair pour donner de la profondeur
+const STARS_BG = `
+  radial-gradient(1.5px 1.5px at 8% 12%, #ffffff, transparent),
+  radial-gradient(1px 1px at 22% 28%, #ffffff, transparent),
+  radial-gradient(2px 2px at 42% 18%, #ffe5b5, transparent),
+  radial-gradient(1px 1px at 58% 38%, #c4d0ff, transparent),
+  radial-gradient(1.5px 1.5px at 71% 22%, #ffffff, transparent),
+  radial-gradient(1px 1px at 86% 48%, #ffffff, transparent),
+  radial-gradient(2px 2px at 94% 18%, #ffe5b5, transparent),
+  radial-gradient(1px 1px at 14% 62%, #ffffff, transparent),
+  radial-gradient(1.5px 1.5px at 32% 78%, #c4d0ff, transparent),
+  radial-gradient(1px 1px at 48% 88%, #ffffff, transparent),
+  radial-gradient(2px 2px at 62% 68%, #ffffff, transparent),
+  radial-gradient(1px 1px at 78% 82%, #ffe5b5, transparent),
+  radial-gradient(1.5px 1.5px at 88% 72%, #ffffff, transparent),
+  radial-gradient(1px 1px at 6% 92%, #c4d0ff, transparent),
+  radial-gradient(1px 1px at 38% 52%, #ffffff, transparent),
+  radial-gradient(1.5px 1.5px at 96% 90%, #ffffff, transparent),
+  radial-gradient(1px 1px at 52% 8%, #ffffff, transparent),
+  radial-gradient(2px 2px at 25% 45%, #ffffff, transparent)
+`.replace(/\s+/g, ' ').trim()
 
 function audioExtFromMime(mimeType) {
   if (!mimeType) return 'webm'
@@ -29,62 +50,6 @@ function audioExtFromMime(mimeType) {
   if (mimeType.includes('ogg')) return 'ogg'
   if (mimeType.includes('mp4')) return 'mp4'
   return 'webm'
-}
-
-function JarvisOrb({ state = 'idle', size = 180 }) {
-  const segments = Array.from({ length: 48 })
-  return (
-    <div className={`jarvis-orb orb-${state}`} style={{ width: size, height: size }}>
-      <svg viewBox="0 0 200 200" className="w-full h-full">
-        <defs>
-          <radialGradient id="orbCoreGrad">
-            <stop offset="0%" stopColor="#a8d0ff" stopOpacity="0.95" />
-            <stop offset="40%" stopColor="#5b9eff" stopOpacity="0.6" />
-            <stop offset="80%" stopColor="#5b9eff" stopOpacity="0.1" />
-            <stop offset="100%" stopColor="#5b9eff" stopOpacity="0" />
-          </radialGradient>
-          <filter id="orbGlow">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
-            <feMerge>
-              <feMergeNode in="blur"/>
-              <feMergeNode in="SourceGraphic"/>
-            </feMerge>
-          </filter>
-        </defs>
-        <g className="orb-outer" filter="url(#orbGlow)">
-          {segments.map((_, i) => {
-            const long = i % 6 === 0
-            return (
-              <line
-                key={i}
-                x1="100" y1={long ? "6" : "10"}
-                x2="100" y2={long ? "20" : "16"}
-                stroke="#5b9eff"
-                strokeOpacity={long ? "0.9" : "0.4"}
-                strokeWidth={long ? "2" : "1"}
-                transform={`rotate(${i * 7.5} 100 100)`}
-              />
-            )
-          })}
-        </g>
-        <circle cx="100" cy="100" r="70" fill="none"
-                stroke="#5b9eff" strokeOpacity="0.35"
-                strokeWidth="1" strokeDasharray="2 6" />
-        <g className="orb-arc">
-          <path d="M 100 35 A 65 65 0 0 1 165 100"
-                stroke="#5b9eff" strokeWidth="2.5" fill="none"
-                strokeLinecap="round" filter="url(#orbGlow)" />
-          <path d="M 100 165 A 65 65 0 0 1 35 100"
-                stroke="#5b9eff" strokeWidth="1.5" fill="none"
-                strokeOpacity="0.5" strokeLinecap="round" />
-        </g>
-        <circle cx="100" cy="100" r="48" fill="none"
-                stroke="#5b9eff" strokeOpacity="0.6" strokeWidth="1.5" />
-        <circle cx="100" cy="100" r="42" fill="url(#orbCoreGrad)" className="orb-core" />
-        <circle cx="100" cy="100" r="2" fill="#ffffff" opacity="0.9" />
-      </svg>
-    </div>
-  )
 }
 
 function formatRemaining(ms) {
@@ -110,7 +75,8 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [showSettings, setShowSettings] = useState(false)
   const [error, setError] = useState(null)
   const [historyLoaded, setHistoryLoaded] = useState(false)
-  const [orbSize, setOrbSize] = useState(550)
+  // Taille de l'avatar - environ 2x plus grande qu'avant (plafond passe de 600 a 1100)
+  const [orbSize, setOrbSize] = useState(900)
 
   const [elevenlabsKey, setElevenlabsKey] = useState('')
   const [elevenlabsVoiceId, setElevenlabsVoiceId] = useState(DEFAULT_VOICE_ID)
@@ -119,7 +85,6 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [notification, setNotification] = useState(null)
   const [now, setNow] = useState(Date.now())
 
-  // Etat de l'autorisation des notifications systeme (granted / denied / default / unsupported)
   const [notifPermission, setNotifPermission] = useState(
     typeof window !== 'undefined' && 'Notification' in window
       ? Notification.permission
@@ -140,8 +105,10 @@ export default function JarvisInterface({ auth, onLogout }) {
     const computeOrbSize = () => {
       const w = window.innerWidth
       const h = window.innerHeight
-      const max = Math.min(w * 0.6, h * 0.55, 600)
-      setOrbSize(Math.max(220, Math.floor(max)))
+      // Coefs augmentes pour avoir un avatar ~2x plus grand qu'avant
+      // Plafond a 1100 (vs 600 avant)
+      const max = Math.min(w * 0.9, h * 0.85, 1100)
+      setOrbSize(Math.max(440, Math.floor(max)))
     }
     computeOrbSize()
     window.addEventListener('resize', computeOrbSize)
@@ -223,29 +190,25 @@ export default function JarvisInterface({ auth, onLogout }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isProcessing])
 
-  // Demande l'autorisation des notifications systeme - doit etre appelee dans un user gesture (Safari)
   const requestNotifPermission = async () => {
     if (!('Notification' in window)) return
-    if (Notification.permission !== 'default') return  // deja decide une fois, on insiste pas
+    if (Notification.permission !== 'default') return
     try {
       const result = await Notification.requestPermission()
       setNotifPermission(result)
-    } catch (e) {
-      // ancien navigateurs : requestPermission n'etait pas une promise
-    }
+    } catch (e) {}
   }
 
-  // Envoie une vraie notif OS si l'utilisateur a accorde la permission - silencieux sinon
   const sendSystemNotification = (message) => {
     if (!('Notification' in window) || Notification.permission !== 'granted') return
     const [titlePart, ...bodyParts] = message.split(' : ')
     const body = bodyParts.length > 0
       ? bodyParts.join(' : ')
-      : 'Reviens sur Jarvis pour arreter la sonnerie'
+      : 'Reviens sur Walle pour arreter la sonnerie'
     try {
-      const notif = new Notification(`Jarvis — ${titlePart}`, {
+      const notif = new Notification(`Walle — ${titlePart}`, {
         body,
-        tag: 'jarvis-alarm',
+        tag: 'walle-alarm',
         requireInteraction: true,
         vibrate: [200, 100, 200, 100, 200]
       })
@@ -410,8 +373,6 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  // Appel ElevenLabs avec preset enfantin/joueur (cf VOICE_SETTINGS en haut de fichier)
-  // Pour ajuster a l'oreille : modifier VOICE_SETTINGS et reload Vite
   const synthesizeElevenLabs = async (text) => {
     try {
       const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${elevenlabsVoiceId}`, {
@@ -586,7 +547,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                  : isProcessing ? 'processing'
                  : 'idle'
 
-  const statusLabel = isJarvisSpeaking ? 'jarvis parle'
+  const statusLabel = isJarvisSpeaking ? 'walle parle'
                     : isListening ? 'ecoute active'
                     : isProcessing ? 'traitement'
                     : `bonjour ${auth.user.name.toLowerCase()}`
@@ -595,29 +556,16 @@ export default function JarvisInterface({ auth, onLogout }) {
   const visibleMessages = messages.slice(-VISIBLE_MESSAGES)
 
   return (
-    <div className="relative min-h-screen w-full overflow-hidden bg-[#06060a] text-[#e8e8ec]">
+    <div className="relative min-h-screen w-full overflow-hidden bg-[#040410] text-[#e8e8ec]">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500&display=swap');
         .font-display { font-family: 'Instrument Serif', serif; font-weight: 400; }
         .font-mono { font-family: 'JetBrains Mono', monospace; }
 
-        @keyframes grid-drift { 0% { background-position: 0 0; } 100% { background-position: 50px 50px; } }
-        .bg-grid {
-          background-image: linear-gradient(rgba(91,158,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(91,158,255,0.05) 1px, transparent 1px);
-          background-size: 50px 50px;
-          animation: grid-drift 30s linear infinite;
-        }
-
         @keyframes pulse-ring { 0% { transform: scale(0.9); opacity: 0.7; } 100% { transform: scale(2.2); opacity: 0; } }
         .pulse-ring { animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
         .pulse-ring-2 { animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; animation-delay: 0.6s; }
         .pulse-ring-3 { animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; animation-delay: 1.2s; }
-
-        @keyframes breathe { 0%, 100% { opacity: 0.4; transform: scale(1); } 50% { opacity: 0.8; transform: scale(1.05); } }
-        .breathe { animation: breathe 3s ease-in-out infinite; }
-
-        @keyframes scan-line { 0% { transform: translateY(-100%); } 100% { transform: translateY(100vh); } }
-        .scan-line { animation: scan-line 8s linear infinite; }
 
         @keyframes message-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         .msg-in { animation: message-in 0.4s ease-out forwards; }
@@ -639,34 +587,6 @@ export default function JarvisInterface({ auth, onLogout }) {
         .glow-accent { box-shadow: 0 0 40px rgba(91,158,255,0.4), inset 0 0 20px rgba(91,158,255,0.1); }
         .glow-text { text-shadow: 0 0 20px rgba(91,158,255,0.5); }
 
-        @keyframes orb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        @keyframes orb-spin-reverse { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
-        @keyframes orb-core-breathe {
-          0%, 100% { transform: scale(0.95); opacity: 0.7; }
-          50% { transform: scale(1.05); opacity: 1; }
-        }
-        @keyframes orb-core-speak {
-          0%, 100% { transform: scale(0.9); opacity: 0.8; filter: brightness(1); }
-          25% { transform: scale(1.15); opacity: 1; filter: brightness(1.4); }
-          50% { transform: scale(1); opacity: 0.95; filter: brightness(1.2); }
-          75% { transform: scale(1.1); opacity: 1; filter: brightness(1.3); }
-        }
-        @keyframes orb-core-listen {
-          0%, 100% { transform: scale(1); opacity: 0.95; }
-          50% { transform: scale(1.08); opacity: 1; }
-        }
-
-        .jarvis-orb { position: relative; display: inline-block; }
-        .jarvis-orb .orb-outer { transform-origin: 100px 100px; animation: orb-spin 30s linear infinite; }
-        .jarvis-orb .orb-arc { transform-origin: 100px 100px; animation: orb-spin-reverse 12s linear infinite; }
-        .jarvis-orb .orb-core { transform-origin: center; animation: orb-core-breathe 4s ease-in-out infinite; }
-        .jarvis-orb.orb-speaking .orb-core { animation: orb-core-speak 0.7s ease-in-out infinite; }
-        .jarvis-orb.orb-speaking .orb-outer { animation-duration: 8s; }
-        .jarvis-orb.orb-speaking .orb-arc { animation-duration: 4s; }
-        .jarvis-orb.orb-listening .orb-core { animation: orb-core-listen 1.2s ease-in-out infinite; }
-        .jarvis-orb.orb-listening .orb-outer { animation-duration: 15s; }
-        .jarvis-orb.orb-processing .orb-arc { animation-duration: 1.5s; }
-
         .orb-stage {
           position: relative;
           display: flex;
@@ -678,10 +598,45 @@ export default function JarvisInterface({ auth, onLogout }) {
         }
       `}</style>
 
-      <div className="absolute inset-0 bg-grid opacity-60 pointer-events-none" />
+      {/* Fond spatial - tuile d'etoiles repetee */}
+      <div className="absolute inset-0 pointer-events-none" style={{
+        backgroundImage: STARS_BG,
+        backgroundSize: '900px 700px',
+        backgroundRepeat: 'repeat'
+      }} />
+
+      {/* Halo nebuleux discret */}
       <div className="absolute inset-0 pointer-events-none"
-           style={{ background: 'radial-gradient(circle at 50% 30%, rgba(91,158,255,0.08), transparent 60%)' }} />
-      <div className="absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-[#5b9eff]/30 to-transparent scan-line pointer-events-none" />
+           style={{ background: 'radial-gradient(circle at 50% 30%, rgba(91,158,255,0.06), transparent 60%)' }} />
+
+      {/* Lune sur le cote gauche */}
+      <div className="absolute pointer-events-none" style={{ left: '60px', top: '140px', width: '200px', height: '200px', zIndex: 1 }}>
+        <svg viewBox="0 0 100 100" className="w-full h-full">
+          <defs>
+            <radialGradient id="moonGlow">
+              <stop offset="40%" stopColor="#fff8e7" stopOpacity="0.35" />
+              <stop offset="75%" stopColor="#fff8e7" stopOpacity="0.08" />
+              <stop offset="100%" stopColor="#fff8e7" stopOpacity="0" />
+            </radialGradient>
+            <radialGradient id="moonBody" cx="40%" cy="40%">
+              <stop offset="0%" stopColor="#fff8e7" />
+              <stop offset="100%" stopColor="#c8c4b4" />
+            </radialGradient>
+          </defs>
+          {/* Halo lumineux */}
+          <circle cx="50" cy="50" r="48" fill="url(#moonGlow)" />
+          {/* Corps de la lune */}
+          <circle cx="50" cy="50" r="32" fill="url(#moonBody)" />
+          {/* Crateres */}
+          <circle cx="38" cy="42" r="5" fill="#a8a494" opacity="0.55" />
+          <circle cx="58" cy="56" r="3" fill="#a8a494" opacity="0.5" />
+          <circle cx="48" cy="65" r="3" fill="#a8a494" opacity="0.5" />
+          <circle cx="62" cy="38" r="4" fill="#b8b4a4" opacity="0.4" />
+          <circle cx="35" cy="58" r="2" fill="#a8a494" opacity="0.5" />
+          <circle cx="55" cy="72" r="2" fill="#b8b4a4" opacity="0.4" />
+          <circle cx="42" cy="50" r="1.5" fill="#a8a494" opacity="0.4" />
+        </svg>
+      </div>
 
       {notification && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-full bg-[#5b9eff] text-[#06060a] font-mono text-sm font-medium msg-in shadow-2xl alarm-pulse">
@@ -696,7 +651,7 @@ export default function JarvisInterface({ auth, onLogout }) {
       <header className="relative z-10 flex items-center justify-between px-8 py-6 border-b border-white/5">
         <div className="flex items-center gap-3">
           <div className="w-6 h-6">
-            <JarvisOrb state={orbState} size={24} />
+            <WalleAvatar state={orbState} size={24} />
           </div>
           <span className={`font-mono text-xs uppercase tracking-[0.3em] ${
             isJarvisSpeaking ? 'text-[#5b9eff] glow-text' :
@@ -707,7 +662,10 @@ export default function JarvisInterface({ auth, onLogout }) {
           </span>
         </div>
 
-        <h1 className="font-display text-2xl tracking-wide italic glow-text">Jarvis</h1>
+        {/* Titre principal - nouveau message Wall-E */}
+        <h1 className="font-display text-lg md:text-xl tracking-wide italic glow-text text-center px-4">
+          Coucou, je suis Walle - Mecanum intelligent
+        </h1>
 
         <button onClick={() => setShowSettings(true)}
                 className="p-2 rounded-full hover:bg-white/5 transition-colors text-[#6b6b78] hover:text-[#e8e8ec]"
@@ -716,9 +674,9 @@ export default function JarvisInterface({ auth, onLogout }) {
         </button>
       </header>
 
-      <main className="relative z-10 flex flex-col items-center px-6 pb-48 pt-2 max-w-5xl mx-auto min-h-[calc(100vh-200px)]">
+      <main className="relative z-10 flex flex-col items-center px-6 pb-48 pt-2 max-w-6xl mx-auto min-h-[calc(100vh-200px)]">
         <div className="orb-stage">
-          <JarvisOrb state={orbState} size={orbSize} />
+          <WalleAvatar state={orbState} size={orbSize} />
           {isEmpty && (
             <>
               <p className="font-display text-3xl italic mt-6 mb-2">Bonsoir, {auth.user.name}.</p>
@@ -734,7 +692,7 @@ export default function JarvisInterface({ auth, onLogout }) {
             <div key={`${m.ts}-${i}`} className={`flex msg-in ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               <div className={`max-w-[80%] ${m.role === 'user' ? 'text-right' : 'text-left'}`}>
                 <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#6b6b78] mb-2">
-                  {m.role === 'user' ? auth.user.name : '— Jarvis'}
+                  {m.role === 'user' ? auth.user.name : '— Walle'}
                 </div>
                 <div className={`inline-block px-5 py-3 rounded-2xl text-[15px] leading-relaxed
                   ${m.role === 'user'
@@ -749,7 +707,7 @@ export default function JarvisInterface({ auth, onLogout }) {
           {isProcessing && (
             <div className="flex justify-start msg-in">
               <div className="max-w-[80%]">
-                <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#6b6b78] mb-2">— Jarvis</div>
+                <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-[#6b6b78] mb-2">— Walle</div>
                 <div className="inline-flex items-center gap-2 px-5 py-3 rounded-2xl bg-white/[0.03] border border-white/5">
                   <span className="w-1.5 h-1.5 rounded-full bg-[#5b9eff] animate-pulse" />
                   <span className="w-1.5 h-1.5 rounded-full bg-[#5b9eff] animate-pulse" style={{ animationDelay: '0.2s' }} />
@@ -786,7 +744,7 @@ export default function JarvisInterface({ auth, onLogout }) {
       )}
 
       <div className="fixed bottom-0 inset-x-0 z-20 pb-10 pt-8 pointer-events-none"
-           style={{ background: 'linear-gradient(to top, #06060a 60%, transparent)' }}>
+           style={{ background: 'linear-gradient(to top, #040410 60%, transparent)' }}>
         <div className="max-w-3xl mx-auto px-6 flex flex-col items-center gap-4 pointer-events-auto">
           {isListening && (
             <div className="font-mono text-sm text-[#5b9eff] text-center">
@@ -870,7 +828,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                   className="w-full px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-[#5b9eff]/50 focus:outline-none font-mono text-sm text-[#e8e8ec] placeholder-[#3a3a44]"
                 />
                 <p className="font-mono text-[10px] text-[#6b6b78] mt-2">
-                  Sans cle : voix navigateur. Avec cle : voix Wall-E (enfantine, joueuse).
+                  Sans cle : voix navigateur. Avec cle : voix Walle (enfantine, joueuse).
                 </p>
               </div>
 
@@ -884,7 +842,7 @@ export default function JarvisInterface({ auth, onLogout }) {
                   className="w-full px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-[#5b9eff]/50 focus:outline-none font-mono text-sm text-[#e8e8ec]"
                 />
                 <p className="font-mono text-[10px] text-[#6b6b78] mt-2">
-                  Wall-E (defaut) · George (Jarvis): JBFqnCBsd6RMkjVDRZzb · Daniel: onwK4e9ZLuTAKqWW03F9 · Adam: pNInz6obpgDQGcFmaJgB
+                  Walle (defaut) · Adam: pNInz6obpgDQGcFmaJgB · Daniel: onwK4e9ZLuTAKqWW03F9
                 </p>
               </div>
 
@@ -893,9 +851,9 @@ export default function JarvisInterface({ auth, onLogout }) {
                   Notifications systeme
                 </label>
                 <div className="px-4 py-3 rounded-lg bg-black/40 border border-white/10 font-mono text-xs">
-                  {notifPermission === 'granted' && <span className="text-green-400">✓ Activees — tu seras prevenue meme onglet en arriere-plan</span>}
-                  {notifPermission === 'denied' && <span className="text-red-300">✗ Bloquees — autorise-les dans les reglages du navigateur pour ce site</span>}
-                  {notifPermission === 'default' && <span className="text-[#6b6b78]">⋯ Pas encore demandees — clique sur le micro pour activer</span>}
+                  {notifPermission === 'granted' && <span className="text-green-400">Activees - tu seras prevenue meme onglet en arriere-plan</span>}
+                  {notifPermission === 'denied' && <span className="text-red-300">Bloquees - autorise-les dans les reglages du navigateur pour ce site</span>}
+                  {notifPermission === 'default' && <span className="text-[#6b6b78]">Pas encore demandees - clique sur le micro pour activer</span>}
                   {notifPermission === 'unsupported' && <span className="text-[#6b6b78]">Non supportees par ce navigateur</span>}
                 </div>
               </div>
