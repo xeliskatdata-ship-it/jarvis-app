@@ -16,8 +16,8 @@ const VOICE_SETTINGS = {
   speed: 1.20
 }
 
-// Reduit a 2 messages visibles (au lieu de 4)
-const VISIBLE_MESSAGES = 2
+// Reduit a 8 messages visibles
+const VISIBLE_MESSAGES = 8
 
 const prefsKey = (userId) => `jarvis_prefs_${userId}`
 const eventsKey = (userId) => `jarvis_events_${userId}`
