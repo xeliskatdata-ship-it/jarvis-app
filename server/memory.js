@@ -10,7 +10,7 @@ import { chat } from './groq.js'
 import { embed, toPgVector } from './mistral.js'
 import { logUsage } from './usage.js'
 
-const TOP_K = 8
+const TOP_K = 5
 
 // === N1 : declencheurs linguistiques pour memoire forcee ===
 const EXPLICIT_TRIGGERS = /\b(souviens[- ]toi (que|de)|n['']oublie pas (que|de)|rappelle[- ]toi (que|de)|retiens (bien )?(que|ceci)|note (bien )?(que|ceci)|memorise (que|ceci)|remember (that|this)|don['']t forget (that|this)|memorize (that|this))\b/i

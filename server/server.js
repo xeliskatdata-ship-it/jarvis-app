@@ -332,7 +332,7 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
       SELECT role, content FROM messages 
       WHERE conversation_id = $1 
       ORDER BY created_at DESC 
-      LIMIT 10
+      LIMIT 6
     `, [conversationId])
     const recentMessages = history.reverse().map(m => ({ role: m.role, content: m.content }))
 
