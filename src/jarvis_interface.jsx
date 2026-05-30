@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Mic, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
+import { Mic, Send, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
 import WalleAvatar from './WalleAvatar'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
-// Voice Wall-E par defaut (timbre choisi par Kat)
+// Voice Wall-E par defaut (timbre créé par mes soins sur ElevenLabs)
 const DEFAULT_VOICE_ID = 'pzMUt9WXzANV4Hu6SUkA'
 
 // Presets voice_settings ElevenLabs - effet enfantin/joueur
@@ -70,7 +70,8 @@ function formatAlarmTime(ts) {
 
 export default function JarvisInterface({ auth, onLogout }) {
   const [messages, setMessages] = useState([])
-  const [isListening, setIsListening] = useState(false)
+  const [isListening, setIsListening] = useState(false)        // gros micro : enregistre + envoie
+  const [isDictating, setIsDictating] = useState(false)        // petit micro : enregistre + met dans le champ
   const [isProcessing, setIsProcessing] = useState(false)
   const [isJarvisSpeaking, setIsJarvisSpeaking] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -78,6 +79,9 @@ export default function JarvisInterface({ auth, onLogout }) {
   const [historyLoaded, setHistoryLoaded] = useState(false)
   // Taille de l'avatar - environ 2x plus grande qu'avant (plafond passe de 600 a 1100)
   const [orbSize, setOrbSize] = useState(900)
+
+  // Champ texte pour ecrire (ou y dicter via le petit micro)
+  const [inputText, setInputText] = useState('')
 
   const [elevenlabsKey, setElevenlabsKey] = useState('')
   const [elevenlabsVoiceId, setElevenlabsVoiceId] = useState(DEFAULT_VOICE_ID)
@@ -101,6 +105,8 @@ export default function JarvisInterface({ auth, onLogout }) {
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
   const mediaStreamRef = useRef(null)
+  // Memorise le mode du recorder actif ('send' = gros mic, 'dictate' = petit mic)
+  const recordModeRef = useRef('send')
 
   useEffect(() => {
     const computeOrbSize = () => {
@@ -433,10 +439,13 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }, [auth.token, elevenlabsKey, elevenlabsVoiceId, onLogout])
 
-  const startRecording = async () => {
+  // Refactor : startRecording accepte un mode ('send' = gros mic, 'dictate' = petit mic)
+  // C'est le mode qui decide ce qu'on fait du blob une fois l'enregistrement fini
+  const startRecording = async (mode = 'send') => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       mediaStreamRef.current = stream
+      recordModeRef.current = mode
 
       const mr = new MediaRecorder(stream)
       audioChunksRef.current = []
@@ -451,31 +460,45 @@ export default function JarvisInterface({ auth, onLogout }) {
         const mime = mr.mimeType || 'audio/webm'
         const blob = new Blob(audioChunksRef.current, { type: mime })
         audioChunksRef.current = []
+        const ext = audioExtFromMime(mime)
+
         if (blob.size < 500) {
           setError('Enregistrement trop court')
-          setIsProcessing(false)
+          if (recordModeRef.current === 'send') setIsProcessing(false)
+          else setIsDictating(false)
           return
         }
-        await transcribeAndSend(blob, audioExtFromMime(mime))
+
+        if (recordModeRef.current === 'send') {
+          await transcribeAndSend(blob, ext)
+        } else {
+          await transcribeToField(blob, ext)
+        }
       }
 
       mediaRecorderRef.current = mr
       mr.start()
-      setIsListening(true)
+      if (mode === 'send') setIsListening(true)
+      else setIsDictating(true)
     } catch (err) {
       setError(`Micro inaccessible : ${err.message || err.name}`)
       setIsListening(false)
+      setIsDictating(false)
     }
   }
 
   const stopRecording = () => {
     if (mediaRecorderRef.current?.state === 'recording') {
       mediaRecorderRef.current.stop()
-      setIsListening(false)
-      setIsProcessing(true)
+      if (recordModeRef.current === 'send') {
+        setIsListening(false)
+        setIsProcessing(true)
+      }
+      // pour 'dictate' : isDictating reste true jusqu'a la fin de la transcription
     }
   }
 
+  // Gros mic : transcrit + envoie direct au backend
   const transcribeAndSend = async (audioBlob, ext) => {
     try {
       const form = new FormData()
@@ -503,6 +526,35 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
+  // Petit mic : transcrit et met le texte DANS le champ (sans envoyer, Kat peut corriger)
+  const transcribeToField = async (audioBlob, ext) => {
+    try {
+      const form = new FormData()
+      form.append('audio', audioBlob, `voice.${ext}`)
+      const res = await fetch(`${API_URL}/transcribe`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${auth.token}` },
+        body: form
+      })
+      if (res.status === 401) { onLogout(); return }
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.error || `Transcription HTTP ${res.status}`)
+      }
+      const { text } = await res.json()
+      if (!text?.trim()) {
+        setError("Je n'ai rien entendu, reessaie en parlant plus distinctement")
+        return
+      }
+      // Append si le champ a deja du texte, sinon remplace
+      setInputText(prev => prev.trim() ? `${prev.trim()} ${text.trim()}` : text.trim())
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setIsDictating(false)
+    }
+  }
+
   const unlockAudioIOS = () => {
     if (audioCtxRef.current) return
     try {
@@ -525,21 +577,57 @@ export default function JarvisInterface({ auth, onLogout }) {
     }
   }
 
-  const toggleListening = () => {
+  // Coupe la voix en cours + unlock iOS - utilise par toggleListening, toggleDictating ET handleTextSubmit
+  const prepareForUserInput = () => {
     setError(null)
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+    if (audioRef.current) audioRef.current.pause()
+    if (audioSourceRef.current) {
+      try { audioSourceRef.current.stop() } catch {}
+      audioSourceRef.current = null
+    }
+    setIsJarvisSpeaking(false)
+    unlockAudioIOS()
+    requestNotifPermission()
+  }
+
+  const toggleListening = () => {
     if (isListening) {
       stopRecording()
     } else {
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel()
-      if (audioRef.current) audioRef.current.pause()
-      if (audioSourceRef.current) {
-        try { audioSourceRef.current.stop() } catch {}
-        audioSourceRef.current = null
-      }
-      setIsJarvisSpeaking(false)
-      unlockAudioIOS()
-      requestNotifPermission()
-      startRecording()
+      // bloquer si dictee en cours
+      if (isDictating || isProcessing) return
+      prepareForUserInput()
+      startRecording('send')
+    }
+  }
+
+  // Petit micro de dictee : enregistre + met le texte dans le champ
+  const toggleDictating = () => {
+    if (isDictating) {
+      stopRecording()
+    } else {
+      // bloquer si gros micro en cours ou traitement
+      if (isListening || isProcessing) return
+      prepareForUserInput()
+      startRecording('dictate')
+    }
+  }
+
+  const handleTextSubmit = () => {
+    const text = inputText.trim()
+    if (!text) return
+    if (isProcessing || isListening || isDictating) return
+    prepareForUserInput()
+    setInputText('')
+    sendToBackend(text)
+  }
+
+  // Enter envoie, Shift+Enter laisse la ligne (au cas ou multiligne plus tard)
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleTextSubmit()
     }
   }
 
@@ -550,11 +638,24 @@ export default function JarvisInterface({ auth, onLogout }) {
 
   const statusLabel = isJarvisSpeaking ? 'walle parle'
                     : isListening ? 'ecoute active'
+                    : isDictating ? 'dictee en cours'
                     : isProcessing ? 'traitement'
                     : `bonjour ${auth.user.name.toLowerCase()}`
 
   const isEmpty = historyLoaded && messages.length === 0 && !isProcessing
   const visibleMessages = messages.slice(-VISIBLE_MESSAGES)
+
+  // Desactive l'input texte pendant l'enregistrement vocal (gros mic) ou le traitement
+  // Reste actif pendant la dictee pour qu'on puisse voir le texte arriver
+  const textInputDisabled = isListening || isProcessing
+  const canSend = inputText.trim().length > 0 && !textInputDisabled && !isDictating
+
+  // Placeholder qui s'adapte au contexte
+  const inputPlaceholder =
+    isListening ? 'micro actif...' :
+    isDictating ? 'je t\'ecoute, parle...' :
+    isProcessing ? 'traitement...' :
+    'ecris a walle'
 
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-[#040410] text-[#e8e8ec]">
@@ -584,6 +685,9 @@ export default function JarvisInterface({ auth, onLogout }) {
 
         @keyframes alarm-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
         .alarm-pulse { animation: alarm-pulse 1s ease-in-out infinite; }
+
+        @keyframes dictate-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .dictate-pulse { animation: dictate-pulse 1.2s ease-in-out infinite; }
 
         .glow-accent { box-shadow: 0 0 40px rgba(91,158,255,0.4), inset 0 0 20px rgba(91,158,255,0.1); }
         .glow-text { text-shadow: 0 0 20px rgba(91,158,255,0.5); }
@@ -657,6 +761,7 @@ export default function JarvisInterface({ auth, onLogout }) {
           <span className={`font-mono text-xs uppercase tracking-[0.3em] ${
             isJarvisSpeaking ? 'text-[#5b9eff] glow-text' :
             isListening ? 'text-[#5b9eff]' :
+            isDictating ? 'text-red-300' :
             isProcessing ? '' : 'text-[#6b6b78]'
           }`}>
             {isProcessing ? <span className="shimmer-text">{statusLabel}</span> : statusLabel}
@@ -682,7 +787,7 @@ export default function JarvisInterface({ auth, onLogout }) {
             <>
               <p className="font-display text-3xl italic mt-6 mb-2">Bonsoir, {auth.user.name}.</p>
               <p className="font-mono text-xs text-[#6b6b78] tracking-wider uppercase">
-                Appuyez sur le micro pour me parler
+                Ecris-moi ou appuie sur le micro
               </p>
             </>
           )}
@@ -761,6 +866,45 @@ export default function JarvisInterface({ auth, onLogout }) {
             </div>
           )}
 
+          {/* Champ texte + petit mic de dictee (a l'interieur du champ, a droite) + bouton Send */}
+          <div className="w-full max-w-xl flex items-center gap-2">
+            <div className="relative flex-1">
+              <input
+                type="text"
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={textInputDisabled}
+                placeholder={inputPlaceholder}
+                className="w-full pl-5 pr-12 py-3 rounded-full bg-white/5 border border-white/10 focus:border-[#5b9eff]/50 focus:outline-none font-mono text-sm text-[#e8e8ec] placeholder-[#3a3a44] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                aria-label="Ecrire un message"
+              />
+              {/* Petit micro de dictee a droite du champ */}
+              <button
+                onClick={toggleDictating}
+                disabled={isListening || isProcessing}
+                className={`absolute right-1 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full flex items-center justify-center transition-all
+                  ${isDictating
+                    ? 'bg-red-500/25 border border-red-500/60 dictate-pulse'
+                    : 'hover:bg-white/10 border border-transparent'}
+                  disabled:opacity-30 disabled:cursor-not-allowed`}
+                aria-label={isDictating ? 'Arreter la dictee' : 'Dicter dans le champ'}
+                title={isDictating ? 'Stop dictee' : 'Dicter (la voix sera transcrite dans le champ)'}
+              >
+                <Mic size={16} strokeWidth={1.5} className={isDictating ? 'text-red-300' : 'text-[#6b6b78]'} />
+              </button>
+            </div>
+            <button
+              onClick={handleTextSubmit}
+              disabled={!canSend}
+              className="w-12 h-12 rounded-full flex items-center justify-center bg-white/5 hover:bg-white/10 border border-white/10 hover:border-[#5b9eff]/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0"
+              aria-label="Envoyer le message"
+            >
+              <Send size={20} strokeWidth={1.5} className="text-[#e8e8ec]" />
+            </button>
+          </div>
+
+          {/* Gros micro principal (record + envoie direct) */}
           <div className="relative flex items-center justify-center">
             {isListening && (
               <>
@@ -771,7 +915,7 @@ export default function JarvisInterface({ auth, onLogout }) {
             )}
             <button
               onClick={toggleListening}
-              disabled={isProcessing}
+              disabled={isProcessing || isDictating}
               className={`relative w-20 h-20 rounded-full flex items-center justify-center transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed
                 ${isListening
                   ? 'bg-[#5b9eff] glow-accent scale-110'
@@ -794,8 +938,9 @@ export default function JarvisInterface({ auth, onLogout }) {
 
           <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-[#6b6b78]">
             {isListening ? 'cliquez pour arreter' :
+             isDictating ? 'cliquez sur le petit mic pour stopper la dictee' :
              isJarvisSpeaking ? 'cliquez pour interrompre' :
-             isProcessing ? '...' : 'cliquez pour parler'}
+             isProcessing ? '...' : 'ecris, dicte (petit mic), ou parle (gros mic)'}
           </p>
         </div>
       </div>
