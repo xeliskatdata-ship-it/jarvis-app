@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Mic, Send, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff } from 'lucide-react'
+import { Mic, Send, Settings, X, AlertCircle, LogOut, Clock, Bell, BellOff, LayoutDashboard } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import WalleAvatar from './WalleAvatar'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
@@ -773,11 +774,24 @@ export default function JarvisInterface({ auth, onLogout }) {
           Coucou, je suis Walle - Mecanum intelligent
         </h1>
 
-        <button onClick={() => setShowSettings(true)}
-                className="p-2 rounded-full hover:bg-white/5 transition-colors text-[#6b6b78] hover:text-[#e8e8ec]"
-                aria-label="Parametres">
-          <Settings size={18} strokeWidth={1.5} />
-        </button>
+        <div className="flex items-center gap-1">
+            {[1, 2].includes(auth.user.id) && (
+              <Link
+                to="/admin"
+                className="p-2 rounded-full hover:bg-white/5 transition-colors text-[#6b6b78] hover:text-[#5b9eff]"
+                aria-label="Mode admin"
+                title="Tableau de bord admin"
+              >
+                <LayoutDashboard size={18} strokeWidth={1.5} />
+              </Link>
+            )}
+            <button onClick={() => setShowSettings(true)}
+                    className="p-2 rounded-full hover:bg-white/5 transition-colors text-[#6b6b78] hover:text-[#e8e8ec]"
+                    aria-label="Parametres">
+              <Settings size={18} strokeWidth={1.5} />
+            </button>
+          </div>
+               
       </header>
 
       <main className="relative z-10 flex flex-col items-center px-6 pb-48 pt-2 max-w-6xl mx-auto min-h-[calc(100vh-200px)]">
