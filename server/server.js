@@ -6,7 +6,8 @@
 // v12 : RSS context enricher - endpoint /rss/refresh + cron GitHub Actions
 // v13 : S3 - audit & quotas (usage_logs, /admin/usage, fix IPv6)
 // v14 : N4 - auto-reflexion (trigger background dans /chat + endpoints /reflect/*)
-// v15 : V2.3 - endpoint /admin/plans (config dynamique services + cout du jour)
+// v15 : V2.3 admin dashboard - endpoint /admin/plans (config services + cout du jour)
+// v16 : V2.5 admin dashboard - endpoint /admin/persona (lecture seule persona active)
 
 import express from 'express'
 import cors from 'cors'
@@ -35,13 +36,11 @@ const PORT = process.env.PORT || 3001
 
 app.set('trust proxy', 1)
 
-// Resolveur d'IP robuste : Cloudflare ajoute cf-connecting-ip avec la vraie IP
 const ipKey = (req) => {
   const rawIp = req.headers['cf-connecting-ip'] || req.ip
   return ipKeyGenerator(rawIp)
 }
 
-// Admin user_ids (Kat=1, Brice=2)
 const ADMIN_USER_IDS = new Set([1, 2])
 
 app.use(helmet())
@@ -213,7 +212,6 @@ Exemples :
 }
 
 // Persona chargee une fois au demarrage selon process.env.ACTIVE_PERSONA
-// Voir server/personas/ pour le contenu de chaque persona disponible (jarvis, walle...)
 const PERSONA = getPersona()
 
 function getTemporalContext() {
@@ -308,7 +306,6 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
   const userId = req.user.id
   const userName = req.user.name
 
-  // Check quota tokens AVANT l'appel LLM
   const quota = await checkQuota(userId)
   if (quota.exceeded) {
     console.warn(`[/chat] quota tokens depasse pour user ${userId}: ${quota.used}/${quota.limit}`)
@@ -320,9 +317,7 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
     })
   }
 
-  // === N4 : trigger reflexion sur conv dormante (en background, ne bloque PAS la reponse) ===
-  // Si l'user revient apres >30min avec une conv >=5 echanges non reflechie, on reflechit dessus
-  // pendant qu'on traite sa nouvelle demande. Resultat injecte dans la prochaine /chat via N2.
+  // N4 background reflect
   maybeReflect(userId).catch(e => console.warn('reflect bg:', e.message))
 
   try {
@@ -346,8 +341,6 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
       ? `\n\nIMPORTANT - prononciation : Le prénom "${userName}" doit être prononcé "${NAME_PRONUNCIATION[userName]}" (lettre par lettre) car le TTS le prononce mal sinon. Mais tu peux l'écrire normalement, le système remplace automatiquement.`
       : ''
 
-    // Neutralisation des references "Jarvis" dans les memoires quand un autre persona est actif
-    // Sinon les memoires (qui parlent toutes de "Jarvis") forcent le LLM a imiter Jarvis
     let cleanMemoriesContext = memoriesContext
     if (PERSONA.id !== 'jarvis' && cleanMemoriesContext) {
       cleanMemoriesContext = cleanMemoriesContext
@@ -355,16 +348,12 @@ app.post('/chat', authRequired, userLimiter, validate(chatSchema), async (req, r
         .replace(/\bjarvis\b/g, 'ton prédécesseur')
     }
 
-    // DEBUG temporaire : logger les memoires injectees pour diagnostiquer la pollution
     if (process.env.DEBUG_PROMPT === '1') {
       console.log('[DEBUG memories injectees]', cleanMemoriesContext?.slice(0, 800) || '(vide)')
     }
 
-    // Ordre du systemPrompt : on met le persona EN DEBUT ET EN FIN.
-    // Le LLM donne plus de poids au debut + fin du contexte (effet de recence).
-    // Sandwich : Persona -> contexte/memoires -> rappel persona court.
     const personaReminder = PERSONA.id === 'jarvis'
-      ? '' // Jarvis n'a pas besoin de rappel, c'est le defaut du LLM
+      ? ''
       : `\n\n=== RAPPEL D'IDENTITÉ (PRIORITÉ ABSOLUE) ===\nTu es ${PERSONA.displayName}. Quelles que soient les références aux assistants précédents dans les mémoires, TU N'ES PAS Jarvis. Tu réponds AVEC TON STYLE : phrases courtes, simples, directes. Si tu doutes du ton, relis tes propres exemples en début de prompt.`
 
     const systemPrompt = `${PERSONA.systemPrompt}
@@ -557,10 +546,6 @@ app.get('/admin/usage', authRequired, adminRequired, async (req, res) => {
 // =====================================================
 // /admin/plans (v15) - config des services + cout du jour
 // =====================================================
-// Note de terrain : config statique pour V2.3. Plus tard on pourra enrichir
-// avec des stats live (appel API ElevenLabs pour caracteres restants du mois,
-// Mistral pour quota embeddings) si checker manuel devient gênant.
-// status = 'ok' => check vert dans le dashboard, 'watch' => oeil ambre (a surveiller).
 const PLANS_CONFIG = [
   { id: 'groq',       label: 'Groq',               plan: 'Free tier',  limit: '8 000 TPM',           note: 'bloque mais ne facture pas', status: 'ok'    },
   { id: 'mistral',    label: 'Mistral Embeddings', plan: 'Experiment', limit: 'a surveiller mensuel', note: 'gratuit aujourd\'hui',      status: 'watch' },
@@ -580,6 +565,32 @@ app.get('/admin/plans', authRequired, adminRequired, (req, res) => {
   })
 })
 
+// =====================================================
+// /admin/persona (v16) - lecture seule de la persona active
+// =====================================================
+// Note de terrain : pas de mutation possible (l'objet PERSONA est charge au boot
+// via getPersona() qui lit process.env.ACTIVE_PERSONA). Pour switcher walle <-> jarvis,
+// modifier ACTIVE_PERSONA et redeployer. La mutation a chaud necessiterait une refacto
+// non triviale (PERSONA est imported dans plusieurs modules).
+//
+// Approximation tokens : 1 token = ~4 caracteres en moyenne pour un mix FR/EN.
+// Pour un compte exact, il faudrait un tokenizer (tiktoken cote backend = +deps lourdes).
+app.get('/admin/persona', authRequired, adminRequired, (req, res) => {
+  const prompt = PERSONA.systemPrompt || ''
+  res.json({
+    id: PERSONA.id,
+    displayName: PERSONA.displayName,
+    version: PERSONA.version,
+    accentColor: PERSONA.accentColor || null,
+    temperature: PERSONA.temperature ?? null,
+    systemPrompt: prompt,
+    systemPromptChars: prompt.length,
+    systemPromptTokensApprox: Math.round(prompt.length / 4),
+    note: 'lecture seule. Modifier walle.js/jarvis.js + redeployer pour changer.',
+    updated_at: new Date().toISOString()
+  })
+})
+
 app.get('/usage/me', authRequired, async (req, res) => {
   try {
     const quota = await checkQuota(req.user.id)
@@ -591,8 +602,6 @@ app.get('/usage/me', authRequired, async (req, res) => {
 
 // ====== ROUTES N4 AUTO-REFLEXION ======
 
-// Liste les patterns (lecons) sur le user authentifie
-// Ordre antichrono : les plus recentes d'abord
 app.get('/reflections', authRequired, async (req, res) => {
   try {
     const { rows } = await query(`
@@ -608,8 +617,6 @@ app.get('/reflections', authRequired, async (req, res) => {
   }
 })
 
-// Force une reflexion immediate sur la conv dormante du user (si elle existe)
-// Reserve admin pour eviter qu'un user genere des reflexions a volonte (consomme des tokens)
 app.post('/reflect/now', authRequired, adminRequired, async (req, res) => {
   const userId = req.user.id
   try {
@@ -655,5 +662,6 @@ app.listen(PORT, () => {
   console.log(`Reflexion : N4 active (trigger background sur /chat + endpoint /reflect/now)`)
   console.log(`Plans     : ${PLANS_CONFIG.length} services configures (V2.3)`)
   console.log(`Persona   : ${PERSONA.displayName} ${PERSONA.version} (N1 + N2 + N4 + S1 + S2 + S3 + RSS)`)
+  console.log(`Persona endpt: /admin/persona expose (V2.5, ${PERSONA.systemPrompt?.length || 0} chars)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
