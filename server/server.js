@@ -6,6 +6,7 @@
 // v12 : RSS context enricher - endpoint /rss/refresh + cron GitHub Actions
 // v13 : S3 - audit & quotas (usage_logs, /admin/usage, fix IPv6)
 // v14 : N4 - auto-reflexion (trigger background dans /chat + endpoints /reflect/*)
+// v15 : V2.3 - endpoint /admin/plans (config dynamique services + cout du jour)
 
 import express from 'express'
 import cors from 'cors'
@@ -553,6 +554,32 @@ app.get('/admin/usage', authRequired, adminRequired, async (req, res) => {
   }
 })
 
+// =====================================================
+// /admin/plans (v15) - config des services + cout du jour
+// =====================================================
+// Note de terrain : config statique pour V2.3. Plus tard on pourra enrichir
+// avec des stats live (appel API ElevenLabs pour caracteres restants du mois,
+// Mistral pour quota embeddings) si checker manuel devient gênant.
+// status = 'ok' => check vert dans le dashboard, 'watch' => oeil ambre (a surveiller).
+const PLANS_CONFIG = [
+  { id: 'groq',       label: 'Groq',               plan: 'Free tier',  limit: '8 000 TPM',           note: 'bloque mais ne facture pas', status: 'ok'    },
+  { id: 'mistral',    label: 'Mistral Embeddings', plan: 'Experiment', limit: 'a surveiller mensuel', note: 'gratuit aujourd\'hui',      status: 'watch' },
+  { id: 'elevenlabs', label: 'ElevenLabs',         plan: 'Free tier',  limit: 'quota mensuel chars', note: 'voix custom Wall-E',         status: 'watch' },
+  { id: 'render',     label: 'Render',             plan: 'Free tier',  limit: 'cold start 30-50s',   note: '750h/mois',                  status: 'ok'    },
+  { id: 'vercel',     label: 'Vercel',             plan: 'Hobby',      limit: 'usage perso',         note: 'pas de limite genante',      status: 'ok'    },
+  { id: 'neon',       label: 'Neon',               plan: 'Free tier',  limit: '0.5 Go DB',           note: 'pgvector inclus',            status: 'ok'    },
+  { id: 'tavily',     label: 'Tavily',             plan: 'Free tier',  limit: '1000 req/mois',       note: 'web search',                 status: 'ok'    },
+]
+
+app.get('/admin/plans', authRequired, adminRequired, (req, res) => {
+  res.json({
+    plans: PLANS_CONFIG,
+    cost_today_eur: 0,
+    note: 'tous services en free tier',
+    updated_at: new Date().toISOString()
+  })
+})
+
 app.get('/usage/me', authRequired, async (req, res) => {
   try {
     const quota = await checkQuota(req.user.id)
@@ -626,6 +653,7 @@ app.listen(PORT, () => {
   console.log(`Quota     : ${DAILY_QUOTA_TOKENS.toLocaleString()} tokens/user/jour`)
   console.log(`Admin IDs : [${Array.from(ADMIN_USER_IDS).join(', ')}]`)
   console.log(`Reflexion : N4 active (trigger background sur /chat + endpoint /reflect/now)`)
+  console.log(`Plans     : ${PLANS_CONFIG.length} services configures (V2.3)`)
   console.log(`Persona   : ${PERSONA.displayName} ${PERSONA.version} (N1 + N2 + N4 + S1 + S2 + S3 + RSS)`)
   console.log(`Temporal  : ${getTemporalContext()}\n`)
 })
