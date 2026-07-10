@@ -7,11 +7,14 @@ on:
     - cron: '0 * * * *'   # toutes les heures pile (UTC)
   workflow_dispatch:        # permet aussi de lancer manuellement depuis l'onglet Actions
 
+# Ce job ne touche jamais au repo (juste un curl externe) => aucune permission accordee au token
+permissions: {}
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 5      # garde-fou : ne devrait jamais depasser 30s en pratique
-    
+
     steps:
       - name: Call RSS refresh endpoint
         env:
@@ -19,24 +22,24 @@ jobs:
           SECRET: ${{ secrets.RSS_REFRESH_SECRET }}
         run: |
           echo "Calling $API_URL/rss/refresh..."
-          
+
           # Wake up Render Free si en cold start (max 50s) - on tolere le 1er fail
           http_code=$(curl -s -o /tmp/body -w "%{http_code}" \
             --max-time 90 \
             -X POST "$API_URL/rss/refresh" \
             -H "X-Refresh-Secret: $SECRET" \
             -H "Content-Type: application/json")
-          
+
           echo ""
           echo "HTTP $http_code"
           echo "Response body:"
           cat /tmp/body
           echo ""
-          
+
           # Fail le job si le HTTP code n'est pas 200
           if [ "$http_code" -ne 200 ]; then
             echo "::error::RSS refresh failed with HTTP $http_code"
             exit 1
           fi
-          
+
           echo "::notice::RSS refresh OK"
